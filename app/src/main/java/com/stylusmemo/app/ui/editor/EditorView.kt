@@ -96,6 +96,9 @@ class EditorView @JvmOverloads constructor(
     private var lastEraseY = 0f
     private val removedStrokesThisGesture = mutableListOf<Pair<Int, Stroke>>()
 
+    /** Eraser segments (x1,y1,x2,y2...) accumulated during a gesture and applied once at pen-up. */
+    private val eraseSegments = mutableListOf<Float>()
+
     private var gestureMode = GestureMode.NONE
     private var gesturePrimaryId = -1
     private var gStartZoom = 3f
@@ -920,6 +923,10 @@ class EditorView @JvmOverloads constructor(
                 }
                 strokeId != null -> {
                     if (isNonActivePointerUp(event)) return true
+                    if (tool == EditorTool.SCRIBBLE_ERASE) {
+                        applyDeferredErase(scribbleEraseWidthMm / 2f)
+                        eraseSegments.clear()
+                    }
                     inProgressView.finishStroke(event, activePointerId, strokeId)
                     activeStrokeId = null
                     activePointerId = -1
@@ -954,6 +961,7 @@ class EditorView @JvmOverloads constructor(
             scribbleEraseActive = false
             scribblePath.clear()
             scribbleRecentPoints.clear()
+            eraseSegments.clear()
             return true
         }
         return true
@@ -1090,6 +1098,7 @@ class EditorView @JvmOverloads constructor(
     private fun startErase(event: MotionEvent, pointerIndex: Int) {
         activePointerId = event.getPointerId(pointerIndex)
         removedStrokesThisGesture.clear()
+        eraseSegments.clear()
         lastEraseX = toMmX(event, pointerIndex)
         lastEraseY = toMmY(event, pointerIndex)
         requestUnbufferedDispatch(event)
@@ -1100,27 +1109,45 @@ class EditorView @JvmOverloads constructor(
         if (idx < 0) return
         val x = toMmX(event, idx)
         val y = toMmY(event, idx)
-        eraseSegment(lastEraseX, lastEraseY, x, y)
+        eraseSegments.add(lastEraseX)
+        eraseSegments.add(lastEraseY)
+        eraseSegments.add(x)
+        eraseSegments.add(y)
         lastEraseX = x
         lastEraseY = y
     }
 
-    private fun eraseSegment(x1: Float, y1: Float, x2: Float, y2: Float) {
+    /**
+     * Applies the accumulated [eraseSegments] once, removing every stroke touched by any segment.
+     * Kept cheap during the gesture: no stroke traversal or re-render happens until pen-up.
+     */
+    private fun applyDeferredErase(radiusMm: Float) {
         val list = strokes.getOrNull(pageIndex) ?: return
-        val toRemove = list.filter { strokeIntersects(it, x1, y1, x2, y2) }
-        if (toRemove.isNotEmpty()) {
-            for (s in toRemove) {
-                val idx = list.indexOf(s)
-                if (idx >= 0) removedStrokesThisGesture.add(idx to s)
-                list.remove(s)
+        if (eraseSegments.isEmpty()) return
+        val toRemove = LinkedHashSet<Stroke>()
+        val r2 = radiusMm * radiusMm
+        val n = eraseSegments.size
+        for (i in 0 until n step 4) {
+            val x1 = eraseSegments[i]
+            val y1 = eraseSegments[i + 1]
+            val x2 = eraseSegments[i + 2]
+            val y2 = eraseSegments[i + 3]
+            for (s in list) {
+                if (s in toRemove) continue
+                if (strokeIntersects(s, x1, y1, x2, y2, r2)) toRemove.add(s)
             }
-            renderContent()
-            invalidate()
         }
+        if (toRemove.isEmpty()) return
+        for (s in toRemove) {
+            val idx = list.indexOf(s)
+            if (idx >= 0) removedStrokesThisGesture.add(idx to s)
+            list.remove(s)
+        }
+        renderContent()
+        invalidate()
     }
 
-    private fun strokeIntersects(s: Stroke, x1: Float, y1: Float, x2: Float, y2: Float): Boolean {
-        val r2 = eraserRadiusMm * eraserRadiusMm
+    private fun strokeIntersects(s: Stroke, x1: Float, y1: Float, x2: Float, y2: Float, r2: Float): Boolean {
         val batch = s.inputs
         for (i in 0 until batch.size) {
             val p = batch.get(i)
@@ -1134,6 +1161,7 @@ class EditorView @JvmOverloads constructor(
     private fun startScribbleErase(event: MotionEvent, pointerIndex: Int) {
         activePointerId = event.getPointerId(pointerIndex)
         removedStrokesThisGesture.clear()
+        eraseSegments.clear()
         scribbleEraseLastX = toMmX(event, pointerIndex)
         scribbleEraseLastY = toMmY(event, pointerIndex)
         clearSelection()
@@ -1142,24 +1170,12 @@ class EditorView @JvmOverloads constructor(
         activeStrokeId = inProgressView.startStroke(event, activePointerId, brush)
     }
 
+    /** Accumulates one scribble-erase segment; actual stroke removal happens at pen-up. */
     private fun scribbleEraseTo(x1: Float, y1: Float, x2: Float, y2: Float) {
-        val list = strokes.getOrNull(pageIndex) ?: return
-        val r2 = (scribbleEraseWidthMm / 2f) * (scribbleEraseWidthMm / 2f)
-        val toRemove = list.filter { s ->
-            val batch = s.inputs
-            (0 until batch.size).any { i ->
-                val p = batch.get(i)
-                distToSegmentSq(p.x, p.y, x1, y1, x2, y2) <= r2
-            }
-        }
-        if (toRemove.isEmpty()) return
-        for (s in toRemove) {
-            val idx = list.indexOf(s)
-            if (idx >= 0) removedStrokesThisGesture.add(idx to s)
-            list.remove(s)
-        }
-        renderContent()
-        invalidate()
+        eraseSegments.add(x1)
+        eraseSegments.add(y1)
+        eraseSegments.add(x2)
+        eraseSegments.add(y2)
     }
 
     /**
@@ -1215,8 +1231,10 @@ class EditorView @JvmOverloads constructor(
 
     private fun finalizeScribbleErase() {
         scribbleEraseActive = false
+        applyDeferredErase(scribbleEraseWidthMm / 2f)
         scribblePath.clear()
         scribbleRecentPoints.clear()
+        eraseSegments.clear()
         if (removedStrokesThisGesture.isNotEmpty()) {
             pushUndo(RemoveStrokesOp(pageIndex, removedStrokesThisGesture.toList()))
             removedStrokesThisGesture.clear()
@@ -1390,6 +1408,8 @@ class EditorView @JvmOverloads constructor(
     }
 
     private fun endErase() {
+        applyDeferredErase(eraserRadiusMm)
+        eraseSegments.clear()
         if (removedStrokesThisGesture.isNotEmpty()) {
             pushUndo(RemoveStrokesOp(pageIndex, removedStrokesThisGesture.toList()))
             removedStrokesThisGesture.clear()
