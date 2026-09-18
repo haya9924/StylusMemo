@@ -7,21 +7,6 @@ import android.os.Build
 import android.util.DisplayMetrics
 import android.view.WindowManager
 
-enum class PagePreset(val displayName: String) {
-    SCREEN_FIT("画面ぴったり"),
-    A4("A4"),
-    A5("A5"),
-    B5("B5"),
-    B4("B4"),
-    LETTER("Letter"),
-    CUSTOM("カスタム"),
-}
-
-enum class PageOrientation(val displayName: String) {
-    PORTRAIT("縦"),
-    LANDSCAPE("横"),
-}
-
 /** A page size expressed in millimeters (device-independent logical units). */
 data class PageSize(
     val widthMm: Float,

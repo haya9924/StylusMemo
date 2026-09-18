@@ -22,6 +22,8 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Save
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -52,6 +54,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.stylusmemo.app.data.AppSettings
@@ -215,13 +219,54 @@ fun SettingsScreen(
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
-                OutlinedButton(onClick = { saveLauncher.launch(null) }) {
-                    Icon(Icons.Default.Save, contentDescription = null)
-                    Text("フォルダを選択")
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(onClick = { saveLauncher.launch(null) }) {
+                        Icon(Icons.Default.Save, contentDescription = null)
+                        Text("フォルダを選択")
+                    }
+                    if (viewModel.saveLocationUri().isNotBlank()) {
+                        OutlinedButton(onClick = { viewModel.setSaveLocationUri("") }) {
+                            Text("デフォルトに戻す")
+                        }
+                    }
                 }
                 Text(
-                    "選択したフォルダ配下の notes/ にメモが保存されます。",
+                    "選択したフォルダ配下の notes/ にメモが保存されます。既存のメモは移動しません。",
                     style = MaterialTheme.typography.bodySmall,
+                )
+            }
+
+            Section("AI 書き出し") {
+                var apiKeyVisible by remember { mutableStateOf(false) }
+                OutlinedTextField(
+                    value = s.aiMarkdownApiKey,
+                    onValueChange = { viewModel.setAiMarkdownApiKey(it) },
+                    label = { Text("Gemini API キー") },
+                    singleLine = true,
+                    visualTransformation = if (apiKeyVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                    trailingIcon = {
+                        IconButton(onClick = { apiKeyVisible = !apiKeyVisible }) {
+                            Icon(
+                                if (apiKeyVisible) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                                contentDescription = if (apiKeyVisible) "隠す" else "表示",
+                            )
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                OutlinedTextField(
+                    value = s.aiMarkdownModel,
+                    onValueChange = { viewModel.setAiMarkdownModel(it) },
+                    label = { Text("モデル") },
+                    supportingText = { Text("例: gemini-2.0-flash") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Text(
+                    "「AI で Markdown 書き出し（Gemini）」プラグインで、ノートの手書き内容を" +
+                        "Gemini が文字起こしします。注意: ページ画像が外部の Google サーバーに送信されます。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
         }

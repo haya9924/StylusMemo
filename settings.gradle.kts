@@ -21,3 +21,10 @@ dependencyResolutionManagement {
 
 rootProject.name = "StylusMemo"
 include(":app")
+include(":cli")
+include(":model")
+include(":plugin-api")
+include(":plugins:export-markdown")
+include(":plugins:export-ai-markdown")
+include(":plugins:memorize")
+include(":plugins:highlighter")

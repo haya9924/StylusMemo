@@ -5,21 +5,28 @@ import kotlin.math.hypot
 import kotlin.math.max
 
 /**
- * GoodNotes-style scribble-to-erase detector. Keeps a small sliding window of raw touch points
+ * GoodNotes-style scribble-to-erase detector. Keeps a small sliding window of raw points
  * — no decimation — and checks whether the motion looks like a dense back-and-forth scribble.
  *
- * Detection uses three complementary, direction-invariant metrics (any one triggers):
- * 1. Axis sign flips of segment velocity — catches zigzags.
- * 2. Dot-product reversals of consecutive vectors — catches sharp direction changes.
+ * Detection is deliberately rate/speed independent: instead of comparing the sign of every tiny
+ * segment (which misses slow scribbles whose per-sample delta is below the threshold), it
+ * accumulates movement until it is significant and then looks for direction reversals.
+ *
+ * Triggers when any of these hold:
+ * 1. Enough axis direction flips of the accumulated velocity — catches zigzags.
+ * 2. Enough dot-product reversals of consecutive accumulated vectors — catches sharp turns.
  * 3. Tortuosity (path-length / net-displacement) — catches circles and random scrubbing.
  */
 object ScribbleDetector {
 
-    const val WINDOW_POINTS = 14
-    const val MIN_REVERSALS = 5
+    const val WINDOW_POINTS = 24
+    const val MIN_REVERSALS = 4
     const val MIN_PATH_LENGTH_MM = 4.5f
-    const val TORTUOSITY_PATH_MM = 7.5f
-    const val TORTUOSITY_RATIO = 3.75f
+    const val TORTUOSITY_PATH_MM = 8.0f
+    const val TORTUOSITY_RATIO = 3.5f
+
+    /** Accumulated movement (mm) before a direction flip is counted. */
+    const val FLIP_MIN_MM = 0.5f
 
     /** Runs the detector over a stream of (x, y) samples. Returns true once scribble is detected. */
     fun detectAll(samples: List<Pair<Float, Float>>): Boolean {
@@ -46,7 +53,7 @@ object ScribbleDetector {
     }
 
     /**
-     * Direction-invariant scribble detection with three complementary metrics.
+     * Direction-invariant, speed-invariant scribble detection with three complementary metrics.
      */
     fun isScribbleMotion(points: List<Float>): Boolean {
         val n = points.size / 2
@@ -54,18 +61,21 @@ object ScribbleDetector {
 
         var xFlips = 0
         var yFlips = 0
+        var reversals = 0
+        var pathLen = 0f
+        var netDx = 0f
+        var netDy = 0f
+
+        // Accumulated direction since the last counted flip, in each axis.
+        var accX = 0f
+        var accY = 0f
         var lastXSign = 0
         var lastYSign = 0
-        var reversals = 0
-        var prevDx = 0f
-        var prevDy = 0f
-        var hasPrevVec = false
-        var pathLen = 0f
+        var lastVecX = 0f
+        var lastVecY = 0f
 
         val firstX = points[0]
         val firstY = points[1]
-        val lastX = points[(n - 1) * 2]
-        val lastY = points[(n - 1) * 2 + 1]
 
         for (i in 1 until n) {
             val ax = points[(i - 1) * 2]
@@ -74,39 +84,47 @@ object ScribbleDetector {
             val by = points[i * 2 + 1]
             val dx = bx - ax
             val dy = by - ay
-            val len = hypot(dx, dy)
+            pathLen += hypot(dx, dy)
+            netDx += dx
+            netDy += dy
+            accX += dx
+            accY += dy
 
-            pathLen += len
-
-            if (len < 0.05f) continue
-
-            val xSign = if (dx > 0.1f) 1 else if (dx < -0.1f) -1 else 0
-            val ySign = if (dy > 0.1f) 1 else if (dy < -0.1f) -1 else 0
-            if (xSign != 0) {
-                if (lastXSign != 0 && xSign != lastXSign) xFlips++
-                lastXSign = xSign
+            if (accX >= FLIP_MIN_MM || accX <= -FLIP_MIN_MM) {
+                val sign = if (accX > 0f) 1 else -1
+                if (lastXSign != 0 && sign != lastXSign) xFlips++
+                lastXSign = sign
+                accX = 0f
             }
-            if (ySign != 0) {
-                if (lastYSign != 0 && ySign != lastYSign) yFlips++
-                lastYSign = ySign
+            if (accY >= FLIP_MIN_MM || accY <= -FLIP_MIN_MM) {
+                val sign = if (accY > 0f) 1 else -1
+                if (lastYSign != 0 && sign != lastYSign) yFlips++
+                lastYSign = sign
+                accY = 0f
             }
-            if (hasPrevVec) {
-                if (dx * prevDx + dy * prevDy < 0f) reversals++
+            // Dot-product reversal of significant accumulated vectors.
+            val mag = hypot(netDx, netDy)
+            if (mag >= FLIP_MIN_MM) {
+                if (lastVecX != 0f || lastVecY != 0f) {
+                    if (netDx * lastVecX + netDy * lastVecY < 0f) reversals++
+                }
+                lastVecX = netDx
+                lastVecY = netDy
+                netDx = 0f
+                netDy = 0f
             }
-            prevDx = dx
-            prevDy = dy
-            hasPrevVec = true
         }
 
-        val netDisp = hypot(lastX - firstX, lastY - firstY)
-        val tortuous = pathLen >= TORTUOSITY_PATH_MM && (netDisp <= 0f || pathLen > TORTUOSITY_RATIO * netDisp)
+        val totalNet = hypot(points[(n - 1) * 2] - firstX, points[(n - 1) * 2 + 1] - firstY)
+        val tortuous = pathLen >= TORTUOSITY_PATH_MM &&
+            (totalNet <= 0f || pathLen > TORTUOSITY_RATIO * totalNet)
 
         val flips = max(xFlips, yFlips)
         val result = flips >= MIN_REVERSALS || reversals >= MIN_REVERSALS || tortuous
 
         if (pathLen >= 2f) {
             Log.d("ScribbleDetect",
-                "n=$n path=$pathLen net=$netDisp xFlip=$xFlips yFlip=$yFlips rev=$reversals tort=$tortuous result=$result")
+                "n=$n path=$pathLen net=$totalNet xFlip=$xFlips yFlip=$yFlips rev=$reversals tort=$tortuous result=$result")
         }
 
         if (pathLen < MIN_PATH_LENGTH_MM) return false

@@ -1,6 +1,7 @@
 [versions]
 agp = "8.13.2"
 kotlin = "2.2.21"
+shadow = "8.3.6"
 coreKtx = "1.16.0"
 lifecycle = "2.9.1"
 activityCompose = "1.10.1"
@@ -8,7 +9,11 @@ composeBom = "2025.06.01"
 navigationCompose = "2.9.0"
 datastore = "1.1.7"
 kotlinxSerialization = "1.8.1"
+kotlinxCoroutines = "1.8.1"
+okhttp = "4.12.0"
 coil = "2.7.0"
+androidxTestExt = "1.2.1"
+androidxTestCore = "1.6.1"
 ink = "1.1.0-alpha06"
 androidxStartup = "1.2.0"
 documentfile = "1.1.0"
@@ -30,6 +35,11 @@ androidx-compose-material-icons = { group = "androidx.compose.material", name = 
 androidx-navigation-compose = { group = "androidx.navigation", name = "navigation-compose", version.ref = "navigationCompose" }
 androidx-datastore-preferences = { group = "androidx.datastore", name = "datastore-preferences", version.ref = "datastore" }
 kotlinx-serialization-json = { group = "org.jetbrains.kotlinx", name = "kotlinx-serialization-json", version.ref = "kotlinxSerialization" }
+kotlinx-coroutines-core = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-core", version.ref = "kotlinxCoroutines" }
+okhttp = { group = "com.squareup.okhttp3", name = "okhttp", version.ref = "okhttp" }
+androidx-test-ext-junit = { group = "androidx.test.ext", name = "junit", version.ref = "androidxTestExt" }
+androidx-test-core = { group = "androidx.test", name = "core", version.ref = "androidxTestCore" }
+androidx-test-runner = { group = "androidx.test", name = "runner", version.ref = "androidxTestCore" }
 coil-compose = { group = "io.coil-kt", name = "coil-compose", version.ref = "coil" }
 androidx-ink-authoring = { group = "androidx.ink", name = "ink-authoring", version.ref = "ink" }
 androidx-ink-rendering = { group = "androidx.ink", name = "ink-rendering", version.ref = "ink" }
@@ -44,5 +54,7 @@ junit = { group = "junit", name = "junit", version.ref = "junit" }
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
 kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
+kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
 kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
 kotlin-serialization = { id = "org.jetbrains.kotlin.plugin.serialization", version.ref = "kotlin" }
+shadow = { id = "com.gradleup.shadow", version.ref = "shadow" }

@@ -15,6 +15,7 @@ android {
         targetSdk = 36
         versionCode = 1
         versionName = "0.1.0"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     buildTypes {
@@ -47,6 +48,12 @@ android {
 }
 
 dependencies {
+    implementation(project(":model"))
+    implementation(project(":plugin-api"))
+    implementation(project(":plugins:export-markdown"))
+    implementation(project(":plugins:export-ai-markdown"))
+    implementation(project(":plugins:memorize"))
+    implementation(project(":plugins:highlighter"))
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.lifecycle.viewmodel.compose)
@@ -76,4 +83,8 @@ dependencies {
     implementation(libs.androidx.documentfile)
 
     testImplementation(libs.junit)
+
+    androidTestImplementation(libs.androidx.test.ext.junit)
+    androidTestImplementation(libs.androidx.test.core)
+    androidTestImplementation(libs.androidx.test.runner)
 }

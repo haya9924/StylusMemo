@@ -25,6 +25,7 @@ data class BackgroundSpec(
     val lineThicknessMm: Float = 0.3f,
     val marginColorArgb: Long = 0xFFE57373,
     val marginXMm: Float = 25f,
+    val showMargin: Boolean = true,
     val dotColorArgb: Long = 0xFF90A4AE,
     val backgroundImageName: String? = null,
 ) {

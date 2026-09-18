@@ -33,12 +33,17 @@ data class AppSettings(
     val defaultPageLayoutMode: PageLayoutMode = PageLayoutMode.SINGLE,
     val defaultPenColorArgb: Long = 0xFF1A1A1A,
     val defaultPenSizeMm: Float = 0.5f,
+    val highlighterColorArgb: Long = 0x66FFEB3B,
+    val highlighterSizeMm: Float = 3.0f,
+    val memorizeTolerance: Float = 90f,
     val saveLocationUri: String = "",
     val stylusPrimaryAction: ShortcutAction = ShortcutAction.TOGGLE_ERASER,
     val stylusSecondaryAction: ShortcutAction = ShortcutAction.UNDO,
     val stylusPrimaryPattern: StylusButtonPattern? = null,
     val stylusSecondaryPattern: StylusButtonPattern? = null,
     val fingerDrawEnabled: Boolean = false,
+    val aiMarkdownApiKey: String = "",
+    val aiMarkdownModel: String = "gemini-2.0-flash",
 ) {
     fun pageSizeFromDefault(context: Context): Pair<Float, Float> {
         val size = when (defaultPagePreset) {
@@ -70,15 +75,21 @@ class SettingsRepository(private val context: Context) {
         val BG_LINE_THICKNESS = floatPreferencesKey("default_bg_line_thickness")
         val BG_MARGIN_COLOR = longPreferencesKey("default_bg_margin_color")
         val BG_MARGIN_X = floatPreferencesKey("default_bg_margin_x")
+        val BG_MARGIN_SHOW = booleanPreferencesKey("default_bg_margin_show")
         val BG_DOT_COLOR = longPreferencesKey("default_bg_dot_color")
         val PEN_COLOR = longPreferencesKey("default_pen_color")
         val PEN_SIZE = floatPreferencesKey("default_pen_size_mm")
+        val HIGHLIGHT_COLOR = longPreferencesKey("highlighter_color")
+        val HIGHLIGHT_SIZE = floatPreferencesKey("highlighter_size_mm")
+        val MEMORIZE_TOLERANCE = floatPreferencesKey("memorize_tolerance")
         val SAVE_LOCATION = stringPreferencesKey("save_location_uri")
         val STYLUS_PRIMARY = stringPreferencesKey("stylus_primary_action")
         val STYLUS_SECONDARY = stringPreferencesKey("stylus_secondary_action")
         val STYLUS_PRIMARY_PATTERN = stringPreferencesKey("stylus_primary_pattern")
         val STYLUS_SECONDARY_PATTERN = stringPreferencesKey("stylus_secondary_pattern")
         val FINGER_DRAW = booleanPreferencesKey("finger_draw_enabled")
+        val AI_MD_API_KEY = stringPreferencesKey("ai_markdown_api_key")
+        val AI_MD_MODEL = stringPreferencesKey("ai_markdown_model")
     }
 
     val settings: Flow<AppSettings> = context.dataStore.data.map { it.toSettings() }
@@ -106,15 +117,21 @@ class SettingsRepository(private val context: Context) {
             prefs[BG_LINE_THICKNESS] = s.defaultBackground.lineThicknessMm
             prefs[BG_MARGIN_COLOR] = s.defaultBackground.marginColorArgb
             prefs[BG_MARGIN_X] = s.defaultBackground.marginXMm
+            prefs[BG_MARGIN_SHOW] = s.defaultBackground.showMargin
             prefs[BG_DOT_COLOR] = s.defaultBackground.dotColorArgb
             prefs[PEN_COLOR] = s.defaultPenColorArgb
             prefs[PEN_SIZE] = s.defaultPenSizeMm
+            prefs[HIGHLIGHT_COLOR] = s.highlighterColorArgb
+            prefs[HIGHLIGHT_SIZE] = s.highlighterSizeMm
+            prefs[MEMORIZE_TOLERANCE] = s.memorizeTolerance
             prefs[SAVE_LOCATION] = s.saveLocationUri
             prefs[STYLUS_PRIMARY] = s.stylusPrimaryAction.name
             prefs[STYLUS_SECONDARY] = s.stylusSecondaryAction.name
             prefs[STYLUS_PRIMARY_PATTERN] = s.stylusPrimaryPattern?.encode() ?: ""
             prefs[STYLUS_SECONDARY_PATTERN] = s.stylusSecondaryPattern?.encode() ?: ""
             prefs[FINGER_DRAW] = s.fingerDrawEnabled
+            prefs[AI_MD_API_KEY] = s.aiMarkdownApiKey
+            prefs[AI_MD_MODEL] = s.aiMarkdownModel
         }
     }
 
@@ -130,6 +147,7 @@ class SettingsRepository(private val context: Context) {
             lineThicknessMm = this[Keys.BG_LINE_THICKNESS] ?: 0.3f,
             marginColorArgb = this[Keys.BG_MARGIN_COLOR] ?: 0xFFE57373,
             marginXMm = this[Keys.BG_MARGIN_X] ?: 25f,
+            showMargin = this[Keys.BG_MARGIN_SHOW] ?: true,
             dotColorArgb = this[Keys.BG_DOT_COLOR] ?: 0xFF90A4AE,
         )
         return AppSettings(
@@ -149,6 +167,9 @@ class SettingsRepository(private val context: Context) {
             }.getOrDefault(PageLayoutMode.SINGLE),
             defaultPenColorArgb = this[Keys.PEN_COLOR] ?: 0xFF1A1A1A,
             defaultPenSizeMm = this[Keys.PEN_SIZE] ?: 0.5f,
+            highlighterColorArgb = this[Keys.HIGHLIGHT_COLOR] ?: 0x66FFEB3B,
+            highlighterSizeMm = this[Keys.HIGHLIGHT_SIZE] ?: 3.0f,
+            memorizeTolerance = this[Keys.MEMORIZE_TOLERANCE] ?: 90f,
             saveLocationUri = this[Keys.SAVE_LOCATION] ?: "",
             stylusPrimaryAction = runCatching {
                 ShortcutAction.valueOf(
@@ -163,6 +184,8 @@ class SettingsRepository(private val context: Context) {
             stylusPrimaryPattern = StylusButtonPattern.decode(this[Keys.STYLUS_PRIMARY_PATTERN]),
             stylusSecondaryPattern = StylusButtonPattern.decode(this[Keys.STYLUS_SECONDARY_PATTERN]),
             fingerDrawEnabled = this[Keys.FINGER_DRAW] ?: false,
+            aiMarkdownApiKey = this[Keys.AI_MD_API_KEY] ?: "",
+            aiMarkdownModel = this[Keys.AI_MD_MODEL] ?: "gemini-2.0-flash",
         )
     }
 }

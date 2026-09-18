@@ -111,10 +111,17 @@ fun BackgroundConfigDialog(
                     }
                     BackgroundType.RULED -> {
                         ColorRow("罫線の色", spec.ruledColorArgb) { pickingColor = "ruled" }
-                        SliderRow("赤マージンの位置 (mm)", spec.marginXMm, 10f..60f) {
-                            spec = spec.copy(marginXMm = it)
+                        FilterChip(
+                            selected = spec.showMargin,
+                            onClick = { spec = spec.copy(showMargin = !spec.showMargin) },
+                            label = { Text("赤マージンを表示") },
+                        )
+                        if (spec.showMargin) {
+                            SliderRow("赤マージンの位置 (mm)", spec.marginXMm, 10f..60f) {
+                                spec = spec.copy(marginXMm = it)
+                            }
+                            ColorRow("赤マージンの色", spec.marginColorArgb) { pickingColor = "margin" }
                         }
-                        ColorRow("赤マージンの色", spec.marginColorArgb) { pickingColor = "margin" }
                     }
                     BackgroundType.DOT -> {
                         ColorRow("ドットの色", spec.dotColorArgb) { pickingColor = "dot" }

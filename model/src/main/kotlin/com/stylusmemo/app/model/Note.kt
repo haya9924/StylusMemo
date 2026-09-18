@@ -9,14 +9,24 @@ data class Note(
     val title: String = "新しいメモ",
     val createdAt: Long = System.currentTimeMillis(),
     val updatedAt: Long = System.currentTimeMillis(),
+    val folder: String = "",
+    val lastPageIndex: Int = 0,
     val pages: List<PageData> = listOf(PageData()),
+    val snips: List<Snip> = emptyList(),
 ) {
     fun withUpdatedAt(): Note = copy(updatedAt = System.currentTimeMillis())
 
     companion object {
-        fun new(title: String, widthMm: Float, heightMm: Float, background: BackgroundSpec): Note =
+        fun new(
+            title: String,
+            widthMm: Float,
+            heightMm: Float,
+            background: BackgroundSpec,
+            folder: String = "",
+        ): Note =
             Note(
                 title = title,
+                folder = folder,
                 pages = listOf(PageData(widthMm, heightMm, background)),
             )
     }
@@ -29,4 +39,5 @@ data class PageData(
     val background: BackgroundSpec = BackgroundSpec(),
     val textBoxes: List<TextBox> = emptyList(),
     val imageBoxes: List<ImageBox> = emptyList(),
+    val id: String = newId("pg"),
 )

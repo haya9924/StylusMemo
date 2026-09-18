@@ -4,11 +4,10 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
-import android.graphics.Matrix
 import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.Rect
 import android.view.View
-import androidx.ink.rendering.android.canvas.CanvasStrokeRenderer
 import androidx.ink.strokes.Stroke
 import com.stylusmemo.app.model.BackgroundSpec
 import com.stylusmemo.app.model.BackgroundType
@@ -16,7 +15,8 @@ import com.stylusmemo.app.model.Note
 
 /**
  * Lightweight preview of a note page: white page, background template and committed strokes.
- * Used on the home screen list. Thumbnails intentionally omit image/PDF backgrounds.
+ * Used on the home screen list. Thumbnails intentionally omit image/PDF backgrounds. The whole
+ * page (background + strokes) is baked into one bitmap so scrolling does not re-path strokes.
  */
 class NoteThumbnailView @JvmOverloads constructor(
     context: Context,
@@ -25,8 +25,7 @@ class NoteThumbnailView @JvmOverloads constructor(
     private var note: Note? = null
     private var strokes: List<Stroke> = emptyList()
     private var pageIndex: Int = 0
-    private val renderer = CanvasStrokeRenderer.create()
-    private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { isFilterBitmap = true }
     private val shadowPaint = Paint().apply { color = Color.argb(40, 0, 0, 0) }
     private var thumbnail: Bitmap? = null
 
@@ -55,18 +54,14 @@ class NoteThumbnailView @JvmOverloads constructor(
         canvas.drawRect(left, top, left + w, top + h, paint.apply { color = Color.WHITE })
 
         if (thumbnail == null) {
-            renderThumbnail(page.widthMm, page.heightMm, page.background, (w * 2f).toInt().coerceAtLeast(64))
+            renderThumbnail(page.widthMm, page.heightMm, page.background, strokes, (w * 2f).toInt().coerceAtLeast(64))
         }
-        thumbnail?.let { canvas.drawBitmap(it, null, Rect(left.toInt(), top.toInt(), (left + w).toInt(), (top + h).toInt()), paint) }
-
-        val m = Matrix().apply {
-            setTranslate(left, top)
-            preScale(scale, scale)
+        thumbnail?.let {
+            canvas.drawBitmap(it, null, Rect(left.toInt(), top.toInt(), (left + w).toInt(), (top + h).toInt()), paint)
         }
-        for (s in strokes) renderer.draw(canvas, s, m)
     }
 
-    private fun renderThumbnail(wMm: Float, hMm: Float, bg: BackgroundSpec, maxDim: Int) {
+    private fun renderThumbnail(wMm: Float, hMm: Float, bg: BackgroundSpec, strokes: List<Stroke>, maxDim: Int) {
         val scale = maxDim / maxOf(wMm, hMm)
         val w = (wMm * scale).toInt().coerceIn(32, 4096)
         val h = (hMm * scale).toInt().coerceIn(32, 4096)
@@ -74,7 +69,32 @@ class NoteThumbnailView @JvmOverloads constructor(
         val c = Canvas(bmp)
         c.drawColor(Color.WHITE)
         drawBackground(c, bg, wMm, hMm, w, h)
+        drawStrokes(c, strokes, w / wMm)
         thumbnail = bmp
+    }
+
+    private fun drawStrokes(c: Canvas, strokes: List<Stroke>, scale: Float) {
+        if (strokes.isEmpty()) return
+        val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeCap = Paint.Cap.ROUND
+            strokeJoin = Paint.Join.ROUND
+        }
+        val path = Path()
+        for (s in strokes) {
+            val batch = s.inputs
+            if (batch.size == 0) continue
+            strokePaint.color = s.brush.colorIntArgb
+            strokePaint.strokeWidth = (s.brush.size * scale).coerceAtLeast(1f)
+            path.reset()
+            val p0 = batch.get(0)
+            path.moveTo(p0.x * scale, p0.y * scale)
+            for (k in 1 until batch.size) {
+                val p = batch.get(k)
+                path.lineTo(p.x * scale, p.y * scale)
+            }
+            c.drawPath(path, strokePaint)
+        }
     }
 
     private fun drawBackground(c: Canvas, bg: BackgroundSpec, wMm: Float, hMm: Float, wPx: Int, hPx: Int) {
@@ -105,7 +125,9 @@ class NoteThumbnailView @JvmOverloads constructor(
                     c.drawLine(0f, y, wPx.toFloat(), y, line)
                     y += spacing
                 }
-                c.drawLine(bg.marginXMm * scale, 0f, bg.marginXMm * scale, hPx.toFloat(), line)
+                if (bg.showMargin) {
+                    c.drawLine(bg.marginXMm * scale, 0f, bg.marginXMm * scale, hPx.toFloat(), line)
+                }
             }
             BackgroundType.DOT -> {
                 val spacing = (bg.spacingMm * scale).coerceAtLeast(2f)
