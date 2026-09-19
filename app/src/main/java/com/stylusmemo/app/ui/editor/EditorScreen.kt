@@ -145,6 +145,7 @@ fun EditorScreen(
     val memorizePluginState by viewModel.memorizeState.collectAsState()
     val eyedropperArmed by viewModel.memorizeEyedropperArmed.collectAsState()
     val loading by viewModel.loading.collectAsState()
+    val pageLoading by viewModel.pageLoading.collectAsState()
     val selectedSnipId by viewModel.selectedSnipId.collectAsState()
     val snipBusy by viewModel.snipBusy.collectAsState()
     val snipError by viewModel.snipError.collectAsState()
@@ -379,6 +380,13 @@ fun EditorScreen(
                     contentAlignment = Alignment.Center,
                 ) {
                     CircularProgressIndicator()
+                }
+            } else if (pageLoading) {
+                Box(
+                    Modifier.fillMaxSize().zIndex(10f),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    CircularProgressIndicator(Modifier.size(40.dp), strokeWidth = 3.dp)
                 }
             }
             }

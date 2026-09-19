@@ -8,6 +8,7 @@ import android.graphics.DashPathEffect
 import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Path
+import android.graphics.Rect
 import android.graphics.RectF
 import android.util.AttributeSet
 import android.view.KeyEvent
@@ -570,7 +571,7 @@ class EditorView @JvmOverloads constructor(
         strokes[page] = loaded.toMutableList()
         dirtyStrokePages.add(page)
         loadedPageIds.add(data.id)
-        pageContentBitmaps.remove(data.id)
+        pageContentBitmaps.remove(data.id)?.recycle()
         invalidate()
     }
 
@@ -987,7 +988,7 @@ class EditorView @JvmOverloads constructor(
         val background = if (cur.background.backgroundImageName != null) BackgroundSpec()
             else cur.background
         val newPage = PageData(widthMm = cur.widthMm, heightMm = cur.heightMm, background = background)
-        val index = n.pages.size
+        val index = (pageIndex + 1).coerceAtMost(n.pages.size)
         pushUndo(AddPageOp(index, newPage))
         insertPage(index, newPage)
         switchPage(index)
@@ -2409,11 +2410,11 @@ class EditorView @JvmOverloads constructor(
         val n = note ?: return
         canvas.drawColor(Color.rgb(0xE4, 0xE7, 0xEC))
         val singleMode = pageLayoutMode == PageLayoutMode.SINGLE
-        for (i in n.pages.indices) {
+        val visible = visiblePageRange()
+        for (i in visible) {
             // In single-page layout all pages share the same offset, so only the active page
             // must be drawn (otherwise the last page always overlays the current one).
             if (singleMode && i != pageIndex) continue
-            if (!pageVisibleOnScreen(i) && i != pageIndex) continue
             renderPageBitmap(i, force = false)
             drawPageOnScreen(canvas, i)
         }
@@ -2489,8 +2490,22 @@ class EditorView @JvmOverloads constructor(
         canvas.drawRect(left, top, right, bottom, whitePaint)
 
         pageContentBitmaps[page.id]?.let { bmp ->
-            val dst = RectF(left, top, right, bottom)
-            canvas.drawBitmap(bmp, null, dst, imageFilter)
+            // Draw only the part of the page that is on screen to cut overdraw while scrolling.
+            val drawLeft = max(left, 0f)
+            val drawTop = max(top, 0f)
+            val drawRight = min(right, width.toFloat())
+            val drawBottom = min(bottom, height.toFloat())
+            if (drawRight > drawLeft && drawBottom > drawTop) {
+                val pxPerMmX = bmp.width / (right - left)
+                val pxPerMmY = bmp.height / (bottom - top)
+                val src = Rect(
+                    ((drawLeft - left) * pxPerMmX).toInt().coerceIn(0, bmp.width - 1),
+                    ((drawTop - top) * pxPerMmY).toInt().coerceIn(0, bmp.height - 1),
+                    ((drawRight - left) * pxPerMmX).toInt().coerceIn(1, bmp.width),
+                    ((drawBottom - top) * pxPerMmY).toInt().coerceIn(1, bmp.height),
+                )
+                canvas.drawBitmap(bmp, src, RectF(drawLeft, drawTop, drawRight, drawBottom), imageFilter)
+            }
         }
 
         drawBoxes(canvas, page, left, top)
@@ -2716,7 +2731,7 @@ class EditorView @JvmOverloads constructor(
                 val p = n.pages[i]
                 val uses = p.background.backgroundImageName == name ||
                     p.imageBoxes.any { it.assetName == name }
-                if (uses) pageContentBitmaps.remove(p.id)
+                if (uses) pageContentBitmaps.remove(p.id)?.recycle()
             }
         }
         val stale = keyedBackgroundCache.keys.filter { it.assetName == name }
@@ -2784,11 +2799,12 @@ class EditorView @JvmOverloads constructor(
     }
 
     /** Desired content bitmap dimensions (px) for [page], bounded by [MAX_CONTENT_PIXELS]. */
-    private fun contentDims(page: PageData): Pair<Int, Int> {
+    private fun contentDims(page: PageData, active: Boolean): Pair<Int, Int> {
         val w = page.widthMm.toDouble()
         val h = page.heightMm.toDouble()
         if (!w.isFinite() || !h.isFinite() || w <= 0.0 || h <= 0.0) return 1 to 1
-        val scale = minOf(BITMAP_DPI.toDouble() / MM_PER_INCH, sqrt(MAX_CONTENT_PIXELS / (w * h)), MAX_BITMAP_DIM / max(w, h))
+        val targetDpi = if (active) ACTIVE_BITMAP_DPI else IDLE_BITMAP_DPI
+        val scale = minOf(targetDpi.toDouble() / MM_PER_INCH, sqrt(MAX_CONTENT_PIXELS / (w * h)), MAX_BITMAP_DIM / max(w, h))
         return (w * scale).toInt().coerceAtLeast(1) to (h * scale).toInt().coerceAtLeast(1)
     }
 
@@ -2803,15 +2819,18 @@ class EditorView @JvmOverloads constructor(
         val page = n.pages.getOrNull(i) ?: return
         evictInvisiblePages()
         if (pageLayoutMode == PageLayoutMode.SINGLE && i != pageIndex) return
+        val active = i == pageIndex
+        val (baseW, baseH) = contentDims(page, active)
         val existing = pageContentBitmaps[page.id]
-        if (!force && existing != null) return
+        // Re-render lazily only when already cached at the resolution this page currently wants
+        // (the active page is sharper than the pages shown alongside it).
+        if (!force && existing != null && existing.width == baseW && existing.height == baseH) return
 
-        val (baseW, baseH) = contentDims(page)
         var wPx = baseW
         var hPx = baseH
         // Reuse the existing bitmap when the dimensions match to avoid per-stroke allocations.
         var bmp: Bitmap? = existing?.takeIf { it.width == wPx && it.height == hPx && !it.isRecycled }
-        if (bmp == null) pageContentBitmaps.remove(page.id)
+        if (bmp == null) pageContentBitmaps.remove(page.id)?.recycle()
         trimPageBitmapBudget(page.id, wPx.toLong() * hPx * 4)
         while (bmp == null) {
             try {
@@ -2970,6 +2989,41 @@ class EditorView @JvmOverloads constructor(
         return !(right < 0f || bottom < 0f || left > width || top > height)
     }
 
+    /** Index range of pages intersecting the viewport, using the monotonic offset cache. */
+    private fun visiblePageRange(): IntRange {
+        val n = note ?: return IntRange.EMPTY
+        val count = n.pages.size
+        if (count == 0) return IntRange.EMPTY
+        if (pageLayoutMode == PageLayoutMode.SINGLE) {
+            val i = pageIndex.coerceIn(0, count - 1)
+            return i..i
+        }
+        val offsets = ensurePageOffsets()
+        if (offsets.size < count) return 0 until count
+        val vertical = pageLayoutMode == PageLayoutMode.VERTICAL
+        val startPx = if (vertical) panY else panX
+        val viewSize = if (vertical) height.toFloat() else width.toFloat()
+        val viewStartMm = -startPx / zoomPxPerMm
+        val viewEndMm = (viewSize - startPx) / zoomPxPerMm
+        var first = 0
+        while (first < count) {
+            val offset = offsets[first]
+            val start = if (vertical) offset.second else offset.first
+            val size = if (vertical) n.pages[first].heightMm else n.pages[first].widthMm
+            if (start + size >= viewStartMm) break
+            first++
+        }
+        if (first >= count) return IntRange.EMPTY
+        var last = first
+        while (last < count) {
+            val offset = offsets[last]
+            val start = if (vertical) offset.second else offset.first
+            if (start > viewEndMm) break
+            last++
+        }
+        return first until last
+    }
+
     /** Frees bitmaps of pages that are not visible and not the active page. */
     private fun evictInvisiblePages() {
         val pages = note?.pages ?: return
@@ -2980,17 +3034,28 @@ class EditorView @JvmOverloads constructor(
             pages.forEachIndexed { i, p -> if (i == pageIndex || pageVisibleOnScreen(i)) keep.add(p.id) }
         }
         val removable = pageContentBitmaps.keys.filter { it !in keep }
-        for (k in removable) pageContentBitmaps.remove(k)
+        for (k in removable) pageContentBitmaps.remove(k)?.recycle()
     }
 
     private fun trimPageBitmapBudget(activeKey: String, requiredBytes: Long) {
-        var bytes = pageContentBitmaps.entries.sumOf { if (it.key == activeKey) 0L else it.value.allocationByteCount.toLong() }
-        val activeId = note?.pages?.getOrNull(pageIndex)?.id
-        val candidates = pageContentBitmaps.keys.filter { it != activeKey }.sortedBy { it == activeId }
+        val n = note ?: return
+        val keep = HashSet<String>()
+        if (pageLayoutMode == PageLayoutMode.SINGLE) {
+            n.pages.getOrNull(pageIndex)?.let { keep.add(it.id) }
+        } else {
+            n.pages.forEachIndexed { i, p -> if (i == pageIndex || pageVisibleOnScreen(i)) keep.add(p.id) }
+        }
+        keep.add(activeKey)
+        var bytes = pageContentBitmaps.entries.sumOf { it.value.allocationByteCount.toLong() }
+        if (bytes + requiredBytes <= PAGE_BITMAP_SOFT_BYTES) return
+        val activeId = n.pages.getOrNull(pageIndex)?.id
+        val candidates = pageContentBitmaps.keys.filter { it !in keep }.sortedBy { it == activeId }
         for (key in candidates) {
-            if (bytes + requiredBytes <= MAX_PAGE_BITMAP_BYTES) break
+            if (bytes + requiredBytes <= PAGE_BITMAP_SOFT_BYTES) break
             val removed = pageContentBitmaps.remove(key) ?: continue
             bytes -= removed.allocationByteCount
+            removed.recycle()
+            removed.recycle()
         }
     }
 
@@ -3089,11 +3154,17 @@ class EditorView @JvmOverloads constructor(
 
         private const val BITMAP_DPI = 300f
 
+        /** Raster density for the page being read/written vs nearby pages shown alongside it. */
+        private const val ACTIVE_BITMAP_DPI = 300f
+        private const val IDLE_BITMAP_DPI = 200f
+
         /** Hard cap on each content bitmap dimension (px) to bound memory. */
         private const val MAX_BITMAP_DIM = 8192
 
         private const val MAX_CONTENT_PIXELS = 8_000_000L
-        private const val MAX_PAGE_BITMAP_BYTES = 48L * 1024 * 1024
+
+        /** Soft budget for cached page bitmaps; visible/active pages are never evicted to meet it. */
+        private const val PAGE_BITMAP_SOFT_BYTES = 96L * 1024 * 1024
     }
 }
 

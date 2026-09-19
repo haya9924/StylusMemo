@@ -94,6 +94,10 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     private val _loading = MutableStateFlow(true)
     val loading: StateFlow<Boolean> = _loading
 
+    /** True while the strokes of the current page are still being loaded (lazy page loading). */
+    private val _pageLoading = MutableStateFlow(false)
+    val pageLoading: StateFlow<Boolean> = _pageLoading
+
     private val _selectedBox = MutableStateFlow<Pair<String, String>?>(null)
     val selectedBox: StateFlow<Pair<String, String>?> = _selectedBox
 
@@ -251,6 +255,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
         _selectedSnipId.value = null
         _snipBusy.value = false
         _snipError.value = null
+        _pageLoading.value = false
         _loading.value = true
         val previousWrite = lastWrite
         openJob = viewModelScope.launch {
@@ -372,11 +377,15 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     private fun loadPageStrokes(page: Int) {
         val id = _noteId.value ?: return
         val generation = noteGeneration
+        if (page == controller.currentPageIndex()) _pageLoading.value = true
         viewModelScope.launch(Dispatchers.IO) {
             val strokes = noteRepo.loadStrokes(id, page)
             withContext(Dispatchers.Main) {
                 if (generation == noteGeneration && _noteId.value == id && !_loading.value) {
                     controller.loadStrokesForPage(page, strokes)
+                }
+                if (generation == noteGeneration && _noteId.value == id) {
+                    _pageLoading.value = !controller.isPageLoaded(controller.currentPageIndex())
                 }
             }
         }
@@ -561,8 +570,12 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
         if (structuralJob?.isActive == true) return
         val id = _noteId.value ?: return
         val generation = noteGeneration
+        _pageLoading.value = true
         structuralJob = viewModelScope.launch {
-            val snapshot = controller.buildSnapshot() ?: return@launch
+            val snapshot = controller.buildSnapshot() ?: run {
+                _pageLoading.value = false
+                return@launch
+            }
             val missing = snapshot.note.pages.indices.filter {
                 snapshot.loadedPages?.contains(it) == false
             }
@@ -579,6 +592,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
             if (generation != noteGeneration || _noteId.value != id) return@launch
             action()
             syncPageState()
+            _pageLoading.value = false
             flushSave()
         }
     }
@@ -617,6 +631,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
         controller.switchPage(i)
         _currentPageData.value = controller.currentPageData()
         _currentPageIndex.value = controller.currentPageIndex()
+        _pageLoading.value = !controller.isPageLoaded(controller.currentPageIndex())
     }
 
     // ------------------------------------------------------------------ memorization mode
