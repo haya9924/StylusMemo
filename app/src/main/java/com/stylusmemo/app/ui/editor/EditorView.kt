@@ -758,6 +758,9 @@ class EditorView @JvmOverloads constructor(
         invalidatePageOffsets()
         if (note != null) {
             fitViewport()
+            // Keep the viewport on the current page: fitViewport resets pan to the document
+            // origin, which looked like jumping back to page 1 in the continuous layouts.
+            scrollToPage(pageIndex)
             invalidate()
         }
     }
@@ -1143,6 +1146,7 @@ class EditorView @JvmOverloads constructor(
         // divider drag, rotation) so the page stays framed inside the pane.
         if (!fittedOnce || w != oldw || h != oldh) {
             fitViewport()
+            scrollToPage(pageIndex)
             fittedOnce = true
             renderContent()
             invalidate()
