@@ -285,7 +285,6 @@ class EditorView @JvmOverloads constructor(
     private val imageFilter = Paint().apply { isFilterBitmap = true }
 
     // Reused across page renders to avoid per-render allocations.
-    private val renderMatrix = Matrix()
     private val renderStrokePaint = Paint().apply {
         style = Paint.Style.STROKE
         strokeCap = Paint.Cap.ROUND
@@ -293,7 +292,6 @@ class EditorView @JvmOverloads constructor(
         isAntiAlias = true
     }
     private val renderPath = Path()
-    private val renderPoint = FloatArray(2)
 
     private enum class GestureMode { NONE, PAN, SCALE }
     private enum class SelectAction { NONE, MOVE, RESIZE, ROTATE }
@@ -2760,29 +2758,26 @@ class EditorView @JvmOverloads constructor(
         val color = stroke.brush.colorIntArgb
         val memSession = memorizeSession
         if (memSession != null && strokeHiddenBySheet(memSession, stroke, color)) return true
-        val scale = bmp.width / page.widthMm
+        val sx = bmp.width / page.widthMm
+        val sy = bmp.height / page.heightMm
         val canvas = Canvas(bmp)
-        val pageToBmp = Matrix().apply { setScale(scale, bmp.height / page.heightMm) }
         val translucent = ((color ushr 24) and 0xFF) < 0xFF
-        val paint = Paint().apply {
-            style = Paint.Style.STROKE
+        // Reuse the render scratch objects instead of allocating a Matrix/Paint/Path/array per
+        // committed stroke; the page -> bitmap transform is a pure scale, so map points directly.
+        val paint = renderStrokePaint.apply {
             strokeCap = if (translucent) Paint.Cap.SQUARE else Paint.Cap.ROUND
             strokeJoin = Paint.Join.ROUND
             isAntiAlias = true
             this.color = color
-            strokeWidth = (stroke.brush.size * scale).coerceAtLeast(1f)
+            strokeWidth = (stroke.brush.size * sx).coerceAtLeast(1f)
         }
-        val path = Path()
-        val pts = FloatArray(2)
+        val path = renderPath
+        path.reset()
         val p0 = inputs.get(0)
-        pts[0] = p0.x; pts[1] = p0.y
-        pageToBmp.mapPoints(pts)
-        path.moveTo(pts[0], pts[1])
+        path.moveTo(p0.x * sx, p0.y * sy)
         for (k in 1 until inputs.size) {
             val pi = inputs.get(k)
-            pts[0] = pi.x; pts[1] = pi.y
-            pageToBmp.mapPoints(pts)
-            path.lineTo(pts[0], pts[1])
+            path.lineTo(pi.x * sx, pi.y * sy)
         }
         canvas.drawPath(path, paint)
         return true
@@ -2875,10 +2870,9 @@ class EditorView @JvmOverloads constructor(
         val pageStrokes = strokes.getOrNull(index).orEmpty()
         if (pageStrokes.isEmpty()) return
         val sx = wPx / page.widthMm
-        val pageToBmp = renderMatrix.apply { setScale(sx, hPx / page.heightMm) }
+        val sy = hPx / page.heightMm
         val paint = renderStrokePaint
         val path = renderPath
-        val pts = renderPoint
         val memSession = memorizeSession
         for (pass in 0..1) {
             val wantTranslucent = pass == 0
@@ -2897,15 +2891,13 @@ class EditorView @JvmOverloads constructor(
                 paint.strokeWidth = (s.brush.size * sx).coerceAtLeast(1f)
                 paint.strokeCap = if (translucent) Paint.Cap.SQUARE else Paint.Cap.ROUND
                 path.reset()
+                // The page -> bitmap transform is a pure scale, so multiply directly rather than
+                // paying a Matrix.mapPoints JNI round trip for every input point.
                 val p0 = inputs.get(0)
-                pts[0] = p0.x; pts[1] = p0.y
-                pageToBmp.mapPoints(pts)
-                path.moveTo(pts[0], pts[1])
+                path.moveTo(p0.x * sx, p0.y * sy)
                 for (k in 1 until inputs.size) {
                     val pi = inputs.get(k)
-                    pts[0] = pi.x; pts[1] = pi.y
-                    pageToBmp.mapPoints(pts)
-                    path.lineTo(pts[0], pts[1])
+                    path.lineTo(pi.x * sx, pi.y * sy)
                 }
                 canvas.drawPath(path, paint)
             }

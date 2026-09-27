@@ -4,7 +4,6 @@ import android.content.ContentResolver
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
-import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.Rect
@@ -303,9 +302,7 @@ private class PageRenderer(private val assetLoader: suspend (String) -> Bitmap?)
         strokeCap = Paint.Cap.ROUND
         strokeJoin = Paint.Join.ROUND
     }
-    private val toBitmap = Matrix()
     private val path = Path()
-    private val point = FloatArray(2)
 
     suspend fun draw(canvas: Canvas, page: PageData, strokes: List<Stroke>, wPx: Int, hPx: Int) {
         val pxPerMm = wPx / page.widthMm
@@ -316,7 +313,8 @@ private class PageRenderer(private val assetLoader: suspend (String) -> Bitmap?)
     }
 
     private fun drawStrokes(canvas: Canvas, strokes: List<Stroke>, pxPerMm: Float) {
-        toBitmap.setScale(pxPerMm, pxPerMm)
+        // The transform is a pure uniform scale, so scale each point directly instead of paying a
+        // Matrix.mapPoints JNI round trip per input point.
         for (s in strokes) {
             val inputs = s.inputs
             if (inputs.size < 1) continue
@@ -324,16 +322,10 @@ private class PageRenderer(private val assetLoader: suspend (String) -> Bitmap?)
             strokePaint.strokeWidth = (s.brush.size * pxPerMm).coerceAtLeast(1f)
             path.reset()
             val p0 = inputs.get(0)
-            point[0] = p0.x
-            point[1] = p0.y
-            toBitmap.mapPoints(point)
-            path.moveTo(point[0], point[1])
+            path.moveTo(p0.x * pxPerMm, p0.y * pxPerMm)
             for (k in 1 until inputs.size) {
                 val pi = inputs.get(k)
-                point[0] = pi.x
-                point[1] = pi.y
-                toBitmap.mapPoints(point)
-                path.lineTo(point[0], point[1])
+                path.lineTo(pi.x * pxPerMm, pi.y * pxPerMm)
             }
             canvas.drawPath(path, strokePaint)
         }

@@ -16,6 +16,8 @@ import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Before
@@ -215,5 +217,35 @@ class NoteRepositoryIncrementalSaveTest {
         assertTrue(page(0).parentFile!!.deleteRecursively())
         repository.saveNote(note, strokes)
         (0..2).forEach { assertPage(it, strokes[it]) }
+    }
+
+    @Test
+    fun failedLoadIsNotCachedAndCannotOverwriteRealNoteJson() = runBlocking {
+        repository.saveNote(note, List(3) { emptyList() })
+        val dir = File(root, "notes/notes/${note.title}")
+        val noteJson = listOf(File(dir, "note.json"), File(dir, "note.json.bin"))
+            .firstOrNull { it.isFile } ?: error("note.json not found")
+        val backup = noteJson.readBytes()
+
+        // Cold repository so noteCache/pathIndex cannot satisfy the read.
+        repository = NoteRepository(context)
+        assertTrue(noteJson.delete())
+        assertNull(repository.loadNoteOrNull(note.id))
+        assertEquals(NoteRepository.UNREADABLE_TITLE, repository.loadNote(note.id).title)
+        // Failure must not be sticky: a second attempt still goes to disk (still missing).
+        assertNull(repository.loadNoteOrNull(note.id))
+
+        noteJson.writeBytes(backup)
+        val restored = repository.loadNoteOrNull(note.id)
+        assertNotNull(restored)
+        assertEquals("incremental-save", restored!!.title)
+
+        // Placeholder save must not replace the restored metadata.
+        val placeholder = Note(id = note.id, title = NoteRepository.UNREADABLE_TITLE)
+        repository = NoteRepository(context)
+        repository.saveNote(placeholder, List(3) { emptyList() })
+        val after = repository.loadNoteOrNull(note.id)
+        assertNotNull(after)
+        assertEquals("incremental-save", after!!.title)
     }
 }

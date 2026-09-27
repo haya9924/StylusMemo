@@ -261,15 +261,26 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
         openJob = viewModelScope.launch {
             previousWrite?.join()
             val snapshot = withContext(Dispatchers.IO) {
-                val note = noteRepo.loadNote(id)
-                val count = note.pages.size
-                val center = note.lastPageIndex.coerceIn(0, (count - 1).coerceAtLeast(0))
-                val window = assetWindow(center, count)
-                val loaded = Array(count) { emptyList<androidx.ink.strokes.Stroke>() }
-                for (i in window) loaded[i] = noteRepo.loadStrokes(id, i)
-                EditorSnapshot(note, loaded.toList(), window.toSet())
+                val note = noteRepo.loadNoteOrNull(id)
+                if (note == null) null else {
+                    val count = note.pages.size
+                    val center = note.lastPageIndex.coerceIn(0, (count - 1).coerceAtLeast(0))
+                    val window = assetWindow(center, count)
+                    val loaded = Array(count) { emptyList<androidx.ink.strokes.Stroke>() }
+                    // One batched call: a single directory resolution instead of one per page.
+                    noteRepo.loadStrokesForPages(id, window).forEach { (i, strokes) ->
+                        if (i in window) loaded[i] = strokes
+                    }
+                    EditorSnapshot(note, loaded.toList(), window.toSet())
+                }
             }
             if (generation != noteGeneration) return@launch
+            if (snapshot == null) {
+                // Do not open a blank placeholder: a later autosave would overwrite the real note.
+                _loading.value = false
+                _snipError.value = "メモを読み込めませんでした。保存先の権限を確認して再試行してください"
+                return@launch
+            }
             pendingSnapshot = snapshot
             _note.value = snapshot.note
             _selectedSnipId.value = snapshot.note.snips.firstOrNull()?.id
@@ -579,12 +590,18 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
             val missing = snapshot.note.pages.indices.filter {
                 snapshot.loadedPages?.contains(it) == false
             }
-            withContext(Dispatchers.IO) {
-                for (i in missing) {
-                    val strokes = noteRepo.loadStrokes(id, i)
-                    withContext(Dispatchers.Main) {
-                        if (generation == noteGeneration && _noteId.value == id) {
-                            controller.loadStrokesForPage(i, strokes)
+            if (missing.isNotEmpty()) {
+                // One batched read, then a single main-thread hop applying every page: previously
+                // each page re-resolved the directory and bounced to the main thread separately.
+                val loaded = withContext(Dispatchers.IO) {
+                    noteRepo.loadStrokesForPages(id, missing)
+                }
+                withContext(Dispatchers.Main) {
+                    if (generation == noteGeneration && _noteId.value == id) {
+                        // applyLoadedStrokes invalidates per page, and the calls land in one frame
+                        // so Android coalesces them into a single traversal.
+                        for (i in missing) {
+                            controller.loadStrokesForPage(i, loaded[i] ?: emptyList())
                         }
                     }
                 }
@@ -670,6 +687,21 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
 
     fun setHighlightColor(argb: Long) {
         _highlightColorArgb.value = argb
+        applyHighlightSpec()
+        persistPenDefaults()
+    }
+
+    /**
+     * Sets the highlighter translucency as a 0f..1f fraction, rewriting only the alpha byte so the
+     * hue chosen in the colour picker is kept. The brush colour is frozen when a stroke is
+     * committed, so this applies to strokes drawn from now on.
+     */
+    fun setHighlightOpacity(opacity: Float) {
+        val alpha = (opacity.coerceIn(0f, 1f) * 255f + 0.5f).toInt().coerceIn(0, 255)
+        val rgb = (_highlightColorArgb.value.toInt() and 0x00FFFFFF).toLong()
+        val next = (alpha.toLong() shl 24) or rgb
+        if (next == _highlightColorArgb.value) return
+        _highlightColorArgb.value = next
         applyHighlightSpec()
         persistPenDefaults()
     }
@@ -958,10 +990,8 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
         val missing = snap.note.pages.indices.filter { it !in loaded }
         if (missing.isNotEmpty()) {
             val id = snap.note.id
-            coroutineScope {
-                missing.map { i -> async(Dispatchers.IO) { i to noteRepo.loadStrokes(id, i) } }
-                    .awaitAll()
-                    .forEach { (i, pageStrokes) -> strokes[i] = pageStrokes }
+            noteRepo.loadStrokesForPages(id, missing).forEach { (i, pageStrokes) ->
+                strokes[i] = pageStrokes
             }
         }
         return EditorSnapshot(snap.note, strokes, null)
@@ -984,7 +1014,10 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     private fun persist() {
         if (_loading.value) return
         val id = _noteId.value ?: return
+        val note = _note.value
+        if (note == null || note.title == NoteRepository.UNREADABLE_TITLE) return
         val snap = controller.buildSnapshot()?.takeIf { it.note.id == id } ?: return
+        if (snap.note.title == NoteRepository.UNREADABLE_TITLE) return
         val previous = lastWrite
         lastWrite = storageScope.launch {
             previous?.join()

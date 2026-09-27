@@ -5,6 +5,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
@@ -390,7 +391,7 @@ fun EditorScreen(
                 }
             }
             }
-            if (!loading && note?.id == noteId) {
+            if (!loading && (note?.id == noteId || snipError != null)) {
                 SnipShelf(
                     noteId = noteId,
                     snips = note?.snips.orEmpty(),
@@ -440,6 +441,7 @@ fun EditorScreen(
             onSize = { viewModel.setPenSize(it) },
             onHighlightColor = { viewModel.setHighlightColor(it) },
             onHighlightSize = { viewModel.setHighlightSize(it) },
+            onHighlightOpacity = { viewModel.setHighlightOpacity(it) },
             onFingerDraw = { viewModel.setFingerDraw(it) },
             onDismiss = { showPenDialog = false },
         )
@@ -927,6 +929,7 @@ private fun PenSettingsDialog(
     onSize: (Float) -> Unit,
     onHighlightColor: (Long) -> Unit,
     onHighlightSize: (Float) -> Unit,
+    onHighlightOpacity: (Float) -> Unit,
     onFingerDraw: (Boolean) -> Unit,
     onDismiss: () -> Unit,
 ) {
@@ -934,12 +937,16 @@ private fun PenSettingsDialog(
     var picking by remember { mutableStateOf<String?>(null) }
     var size by remember(sizeMm) { mutableStateOf(sizeMm) }
     var hlSize by remember(highlightSizeMm) { mutableStateOf(highlightSizeMm) }
+    var hlOpacity by remember(highlightColorArgb) {
+        mutableStateOf(((highlightColorArgb.toInt() ushr 24) and 0xFF) / 255f)
+    }
     var finger by remember(fingerDraw) { mutableStateOf(fingerDraw) }
 
     if (picking != null) {
         val isHighlight = picking == "highlight"
         ColorPickerDialog(
             initialArgb = if (isHighlight) highlightColorArgb else colorArgb,
+            allowAlpha = isHighlight,
             onDismiss = { picking = null },
             onPick = {
                 if (isHighlight) onHighlightColor(it) else onColor(it)
@@ -973,7 +980,19 @@ private fun PenSettingsDialog(
                         Text("色", style = MaterialTheme.typography.bodyMedium)
                         Box(
                             Modifier.size(32.dp).background(Color(highlightColorArgb.toInt()), CircleShape)
+                                .border(1.dp, MaterialTheme.colorScheme.outline, CircleShape)
                                 .clickable { picking = "highlight" },
+                        )
+                    }
+                    Column {
+                        Text(
+                            "不透明度 ${(hlOpacity * 100).toInt()} %",
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                        Slider(
+                            value = hlOpacity,
+                            onValueChange = { hlOpacity = it; onHighlightOpacity(it) },
+                            valueRange = 0.1f..1f,
                         )
                     }
                     Column {

@@ -53,7 +53,12 @@ class NoteRepository(private val context: Context) {
             size > 64
     }
 
-    private data class ResolvedDirectory(val root: Uri, val path: String, val directory: DocumentFile)
+    private data class ResolvedDirectory(
+        val root: Uri,
+        val path: String,
+        val directory: DocumentFile,
+        val noteJsonStamp: NoteJsonStamp?,
+    )
 
     internal class ChildDocuments(
         private val capacity: Int = 64,
@@ -81,6 +86,56 @@ class NoteRepository(private val context: Context) {
         fun clear() = directories.clear()
     }
 
+    /**
+     * Access-ordered LRU cache with an optional weight budget. Eviction is always safe here because
+     * these caches only memoise values that can be re-read from storage.
+     */
+    internal class BoundedCache<K : Any, V : Any>(
+        private val maxEntries: Int = Int.MAX_VALUE,
+        private val maxBytes: Long = Long.MAX_VALUE,
+        private val weigh: (V) -> Long = { 0L },
+    ) {
+        private data class Entry<V : Any>(val value: V, val weight: Long)
+
+        private val entries = object : LinkedHashMap<K, Entry<V>>(64, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<K, Entry<V>>): Boolean {
+                if (size <= 1) return false
+                totalWeight -= eldest.value.weight
+                return size > maxEntries || totalWeight > maxBytes
+            }
+        }
+
+        private var totalWeight = 0L
+
+        val values: Collection<V> get() = entries.values.map { it.value }
+
+        operator fun get(key: K): V? = entries[key]?.value
+
+        operator fun set(key: K, value: V) {
+            // Replace in place without double-counting the evicted copy's weight.
+            entries[key]?.let { totalWeight -= it.weight }
+            val weight = weigh(value)
+            entries[key] = Entry(value, weight)
+            totalWeight += weight
+        }
+
+        fun remove(key: K): V? {
+            val hit = entries.remove(key) ?: return null
+            totalWeight -= hit.weight
+            return hit.value
+        }
+
+        fun removeKeysIf(predicate: (K) -> Boolean) {
+            val doomed = entries.keys.filter(predicate)
+            for (key in doomed) entries.remove(key)?.let { totalWeight -= it.weight }
+        }
+
+        fun clear() {
+            entries.clear()
+            totalWeight = 0
+        }
+    }
+
     private fun invalidateDirectories() {
         childDocuments.clear()
         noteDirectories.clear()
@@ -89,35 +144,74 @@ class NoteRepository(private val context: Context) {
     private fun createDirectory(parent: DocumentFile, name: String): DocumentFile? =
         parent.createDirectory(name)?.let { childDocuments.created(parent, it) }
 
-    private suspend inline fun <T> withStorageLock(block: () -> T): T = mutex.withLock {
-        childDocuments.clear()
+    /**
+     * Runs [block] under the storage mutex. Pass `mutates = true` for anything that writes or
+     * deletes so the child-directory cache is dropped on both sides of the critical section: a
+     * write can be made stale by an external change, and a read that follows must not reuse the
+     * pre-write listing. Read-only callers leave the default so the cache survives, which is what
+     * makes repeated lookups cheap (a `listFiles()` per call is a ContentResolver round trip on SAF).
+     */
+    private suspend inline fun <T> withStorageLock(
+        mutates: Boolean = false,
+        block: () -> T,
+    ): T = mutex.withLock {
+        if (mutates) childDocuments.clear()
         try {
             block()
         } finally {
-            childDocuments.clear()
+            if (mutates) childDocuments.clear()
         }
     }
 
     /** noteId -> relative path (under the notes directory). Best-effort cache of index.json. */
     private val pathIndex = mutableMapOf<String, String>()
 
-    private companion object {
-        const val TAG = "NoteRepository"
-        const val FILE_MIME = "application/octet-stream"
-        const val LEGACY_SUFFIX = ".bin"
-        const val INDEX_FILE = "index.json"
-        const val FOLDERS_FILE = "folders.json"
-        const val MAX_DEPTH = 8
+    /** Set whenever [pathIndex] changes so [persistIndex] knows the file is stale. */
+    private var pathIndexDirty = false
+
+    private fun setPathIndex(noteId: String, path: String) {
+        if (pathIndex[noteId] != path) pathIndexDirty = true
+        pathIndex[noteId] = path
     }
 
-    /** Session cache of the latest in-memory note state, so a just-saved note always reopens. */
-    private val noteCache = mutableMapOf<String, Note>()
+    private fun clearPathIndex() {
+        if (pathIndex.isNotEmpty()) pathIndexDirty = true
+        pathIndex.clear()
+    }
+
+    companion object {
+        private const val TAG = "NoteRepository"
+        private const val FILE_MIME = "application/octet-stream"
+        private const val LEGACY_SUFFIX = ".bin"
+        private const val INDEX_FILE = "index.json"
+        private const val FOLDERS_FILE = "folders.json"
+        private const val MAX_DEPTH = 8
+
+        /**
+         * Title used by the in-memory placeholder when note.json cannot be read.
+         * Never persisted: saving it would overwrite a real note with a blank stub.
+         */
+        const val UNREADABLE_TITLE = "読み進めないメモ"
+    }
+
+    /**
+     * Session cache of the latest in-memory note state, so a just-saved note always reopens.
+     * Bounded because it used to grow for the whole session; evicting only costs a re-read.
+     */
+    private val noteCache = BoundedCache<String, Note>(maxEntries = 64)
 
     /**
      * Session cache of parsed page strokes, keyed by "noteId:pageIndex". Avoids re-reading and
-     * re-decoding page-<n>.bin files when a note is reopened. Cleared when the root changes.
+     * re-decoding page-<n>.bin files when a note is reopened. Bounded by an approximate decoded
+     * size: decoded strokes are far larger than their on-disk form, so an unbounded cache turned
+     * into sustained GC pressure that slowed down frame times.
      */
-    private val strokeCache = mutableMapOf<String, List<Stroke>>()
+    private val strokeCache = BoundedCache<String, List<Stroke>>(maxBytes = 48L * 1024 * 1024) {
+        strokes ->
+        var total = 0L
+        for (s in strokes) total += 96L + s.inputs.size * 8L
+        total
+    }
 
     private data class PersistedPage(val uri: Uri, val strokes: List<Stroke>)
 
@@ -136,7 +230,7 @@ class NoteRepository(private val context: Context) {
         persistedStrokes = ConcurrentHashMap()
         noteCache.clear()
         strokeCache.clear()
-        pathIndex.clear()
+        clearPathIndex()
         invalidateDirectories()
     }
 
@@ -217,7 +311,15 @@ class NoteRepository(private val context: Context) {
 
     // ------------------------------------------------------------------ index
 
+    /**
+     * Rescans the tree from scratch. This is the recovery path taken when a note cannot be resolved
+     * through the cached path, so it must observe the real directory contents: the child-document
+     * cache can predate an external change (a note added, renamed or restored outside this
+     * repository) and would otherwise hide it. Dropping the cache here costs one extra listing per
+     * recovery instead of one per every read.
+     */
     private suspend fun rebuildIndex(notes: DocumentFile): MutableMap<String, String> {
+        childDocuments.clear()
         val map = mutableMapOf<String, String>()
         scanIndex(notes, "", 0, map)
         return map
@@ -250,41 +352,81 @@ class NoteRepository(private val context: Context) {
         }
     }
 
+    /**
+     * Writes index.json only when the id -> path map actually changed. Autosave calls this on every
+     * save, and the map is untouched by ordinary page writes, so this removes a full re-serialisation
+     * of the whole library per autosave. index.json is a cache and is rebuilt by [rebuildIndex].
+     */
     private suspend fun persistIndex(notes: DocumentFile) {
+        if (!pathIndexDirty) return
+        pathIndexDirty = false
         runCatching { writeJson(notes, INDEX_FILE, pathIndex.toMap()) }
+            .onFailure { pathIndexDirty = true }
     }
 
     private suspend fun resolveNoteDir(noteId: String): DocumentFile? {
         val notes = notesDir()
         val cached = noteDirectories.remove(noteId)
         if (cached != null && cached.root == notes.uri && cached.path == pathIndex[noteId] &&
-            cached.directory.isDirectory && cached.directory.name == cached.path.substringAfterLast('/') &&
-            containsNote(cached.directory, noteId)
+            cached.directory.isDirectory && cached.directory.name == cached.path.substringAfterLast('/')
         ) {
-            noteDirectories[noteId] = cached
-            return cached.directory
+            val check = checkNote(cached.directory, noteId, cached.noteJsonStamp)
+            if (check.ok) {
+                noteDirectories[noteId] =
+                    if (check.stamp != null) cached.copy(noteJsonStamp = check.stamp) else cached
+                return cached.directory
+            }
         }
         pathIndex[noteId]?.let { rel ->
             navigate(notes, rel.split('/'), create = false)?.let { dir ->
-                if (containsNote(dir, noteId)) {
-                    noteDirectories[noteId] = ResolvedDirectory(notes.uri, rel, dir)
+                val check = checkNote(dir, noteId, null)
+                if (check.ok) {
+                    noteDirectories[noteId] = ResolvedDirectory(notes.uri, rel, dir, check.stamp)
                     return dir
                 }
             }
         }
         noteDirectories.clear()
-        pathIndex.clear()
-        pathIndex.putAll(rebuildIndex(notes))
+        clearPathIndex()
+        pathIndex.putAll(rebuildIndex(notes)); pathIndexDirty = true
         val rel = pathIndex[noteId] ?: return null
         return navigate(notes, rel.split('/'), create = false)?.also {
-            noteDirectories[noteId] = ResolvedDirectory(notes.uri, rel, it)
+            noteDirectories[noteId] = ResolvedDirectory(notes.uri, rel, it, null)
         }
     }
 
-    private suspend fun containsNote(dir: DocumentFile, noteId: String): Boolean =
-        resolveFile(dir, "note.json")?.let { file ->
-            runCatching { json.decodeFromString<Note>(readText(file)).id == noteId }.getOrDefault(false)
-        } ?: false
+    /**
+     * Identity of a note.json on disk. Reading and deserialising a note can mean hundreds of
+     * kilobytes, which used to happen on *every* repository call because the note directory was
+     * re-validated each time. Comparing this cheap fingerprint instead lets repeat lookups skip the
+     * parse while still noticing an external edit or replacement.
+     */
+    private data class NoteJsonStamp(val modified: Long, val length: Long) {
+        /**
+         * Providers that do not report a modification time would make every file look identical, so
+         * a zero timestamp disqualifies the fingerprint and forces a real read.
+         */
+        val usable: Boolean get() = modified > 0L
+    }
+
+    private class NoteCheck(val ok: Boolean, val stamp: NoteJsonStamp?)
+
+    private fun noteJsonStamp(file: DocumentFile): NoteJsonStamp? = runCatching {
+        NoteJsonStamp(file.lastModified(), file.length())
+    }.getOrNull()?.takeIf { it.usable }
+
+    /**
+     * True when [dir] still holds the note.json of [noteId]. [known] is the fingerprint already
+     * validated for this id; when it still matches, the file is unchanged and the read is skipped.
+     */
+    private suspend fun checkNote(dir: DocumentFile, noteId: String, known: NoteJsonStamp?): NoteCheck {
+        val file = resolveFile(dir, "note.json") ?: return NoteCheck(false, null)
+        val current = noteJsonStamp(file)
+        if (known != null && current != null && known == current) return NoteCheck(true, current)
+        val ok = runCatching { json.decodeFromString<Note>(readText(file)).id == noteId }
+            .getOrDefault(false)
+        return NoteCheck(ok, if (ok) current else null)
+    }
 
     // ------------------------------------------------------------------ list / create
 
@@ -298,9 +440,9 @@ class NoteRepository(private val context: Context) {
             if (notes.canRead() && notes.isDirectory) {
                 scanNotes(notes, "", 0, out, index)
             }
-            pathIndex.clear()
-            pathIndex.putAll(index)
-            (out + noteCache.values.toList())
+            clearPathIndex()
+            pathIndex.putAll(index); pathIndexDirty = true
+            (out + noteCache.values)
                 .distinctBy { it.id }
                 .sortedByDescending { it.updatedAt }
         }
@@ -343,7 +485,7 @@ class NoteRepository(private val context: Context) {
         background: com.stylusmemo.app.model.BackgroundSpec,
         folder: String = "",
     ): Note = withContext(Dispatchers.IO) {
-        withStorageLock {
+        withStorageLock(mutates = true) {
             val note = Note.new(title, widthMm, heightMm, background, folder)
             val notes = notesDir()
             val segs = folderSegments(folder)
@@ -352,7 +494,7 @@ class NoteRepository(private val context: Context) {
             val dir = createDirectory(parent, name) ?: error("create directory failed")
             val rel = (segs + name).joinToString("/")
             noteCache[note.id] = note
-            pathIndex[note.id] = rel
+            setPathIndex(note.id, rel)
             writeJson(dir, "note.json", note)
             writeBytes(dir, "page-0.bin", StrokeCodec.toBytes(emptyList()))
             persistIndex(notes)
@@ -360,78 +502,103 @@ class NoteRepository(private val context: Context) {
         }
     }
 
-    suspend fun loadNote(noteId: String): Note = withContext(Dispatchers.IO) {
+    /**
+     * Reads note metadata, or returns null when note.json is missing/unreadable.
+     *
+     * Failures are never cached as a fake note: the next open retries disk, and a later
+     * save cannot replace a real note.json with a placeholder (see [saveNote]).
+     */
+    suspend fun loadNoteOrNull(noteId: String): Note? = withContext(Dispatchers.IO) {
         withStorageLock {
             noteCache[noteId]?.let { return@withStorageLock it }
-            val dir = resolveNoteDir(noteId)
-            if (dir != null) {
+            val loaded = runCatching {
+                val dir = resolveNoteDir(noteId)
+                    ?: error("directory for $noteId not found")
                 val file = resolveFile(dir, "note.json")
-                if (file != null) {
-                    runCatching {
-                        json.decodeFromString<Note>(readText(file))
-                    }.getOrNull()?.let {
-                        noteCache[noteId] = it
-                        return@withStorageLock it
-                    }
-                }
-            }
-            val fallback = Note(id = noteId, title = "読み込めないメモ")
-            noteCache[noteId] = fallback
-            fallback
+                    ?: error("note.json missing in ${dir.uri}")
+                json.decodeFromString<Note>(readText(file))
+            }.onFailure { e ->
+                Log.w(TAG, "loadNote failed for $noteId", e)
+            }.getOrNull()
+            loaded?.let { noteCache[noteId] = it }
+            loaded
         }
     }
 
+    /**
+     * Like [loadNoteOrNull], but returns a placeholder on failure so existing callers keep
+     * working. The placeholder is not cached and must not be saved.
+     */
+    suspend fun loadNote(noteId: String): Note =
+        loadNoteOrNull(noteId) ?: Note(id = noteId, title = UNREADABLE_TITLE)
+
     suspend fun loadStrokes(noteId: String, pageIndex: Int): List<Stroke> =
-        withContext(Dispatchers.IO) {
-            withStorageLock {
-                strokeCache[strokeKey(noteId, pageIndex)]?.let { return@withStorageLock it }
-                val dir = resolveNoteDir(noteId) ?: return@withStorageLock emptyList()
-                val file = resolveFile(dir, "page-$pageIndex.bin") ?: return@withStorageLock emptyList()
-                val strokes = runCatching { StrokeCodec.fromBytes(readBytes(file)) }
-                    .getOrElse { emptyList() }
-                strokeCache[strokeKey(noteId, pageIndex)] = strokes
-                strokes
+        loadStrokesForPages(noteId, listOf(pageIndex))[pageIndex] ?: emptyList()
+
+    /**
+     * Loads the strokes of the requested pages of a note in one pass: a single directory resolution
+     * and a single lock acquisition, with the page files read in parallel. Callers that need several
+     * pages (opening a note, filling gaps before an export, a structural page change) should use this
+     * instead of calling [loadStrokes] in a loop, which re-resolves the directory and re-reads
+     * note.json once per page.
+     *
+     * Pages that are missing or unreadable map to an empty list, and every requested index is
+     * present in the result.
+     */
+    suspend fun loadStrokesForPages(
+        noteId: String,
+        pageIndices: List<Int>,
+    ): Map<Int, List<Stroke>> = withContext(Dispatchers.IO) {
+        if (pageIndices.isEmpty()) return@withContext emptyMap()
+        withStorageLock {
+            val unique = pageIndices.distinct()
+            val cached = HashMap<Int, List<Stroke>>(unique.size)
+            val need = ArrayList<Int>()
+            val files = HashMap<Int, DocumentFile?>()
+            val dir = if (unique.isEmpty()) null else resolveNoteDir(noteId)
+            for (i in unique) {
+                val hit = strokeCache[strokeKey(noteId, i)]
+                if (hit != null) {
+                    cached[i] = hit
+                } else {
+                    need.add(i)
+                    files[i] = dir?.let { resolveFile(it, "page-$i.bin") }
+                }
             }
+            if (need.isNotEmpty()) {
+                val loaded = java.util.concurrent.ConcurrentHashMap<Int, List<Stroke>>()
+                coroutineScope {
+                    need.map { i ->
+                        async(Dispatchers.IO) {
+                            val file = files[i]
+                            loaded[i] = if (file == null) {
+                                emptyList()
+                            } else {
+                                runCatching { StrokeCodec.fromBytes(readBytes(file)) }
+                                    .getOrElse { emptyList() }
+                            }
+                        }
+                    }.awaitAll()
+                }
+                for (i in need) {
+                    val strokes = loaded[i] ?: emptyList()
+                    strokeCache[strokeKey(noteId, i)] = strokes
+                    cached[i] = strokes
+                }
+            }
+            cached
         }
+    }
 
     /**
      * Loads the strokes for all pages of a note in one pass (single directory resolution, single
      * lock). Missing pages are read in parallel to cut wall-clock time on large notes.
      */
-    suspend fun loadAllStrokes(noteId: String, pageCount: Int): List<List<Stroke>> =
-        withContext(Dispatchers.IO) {
-            if (pageCount <= 0) return@withContext emptyList()
-            withStorageLock {
-                val dir = resolveNoteDir(noteId)
-                val files = arrayOfNulls<DocumentFile?>(pageCount)
-                val need = ArrayList<Int>()
-                for (i in 0 until pageCount) {
-                    if (strokeCache[strokeKey(noteId, i)] != null) continue
-                    files[i] = dir?.let { resolveFile(it, "page-$i.bin") }
-                    need.add(i)
-                }
-                val loaded = java.util.concurrent.ConcurrentHashMap<Int, List<Stroke>>()
-                if (need.isNotEmpty()) {
-                    coroutineScope {
-                        need.map { i ->
-                            async(Dispatchers.IO) {
-                                val file = files[i]
-                                loaded[i] = if (file == null) emptyList()
-                                else runCatching { StrokeCodec.fromBytes(readBytes(file)) }
-                                    .getOrElse { emptyList() }
-                            }
-                        }.awaitAll()
-                    }
-                }
-                val result = ArrayList<List<Stroke>>(pageCount)
-                for (i in 0 until pageCount) {
-                    val strokes = strokeCache[strokeKey(noteId, i)] ?: loaded[i] ?: emptyList()
-                    strokeCache[strokeKey(noteId, i)] = strokes
-                    result.add(strokes)
-                }
-                result
-            }
-        }
+    suspend fun loadAllStrokes(noteId: String, pageCount: Int): List<List<Stroke>> {
+        if (pageCount <= 0) return emptyList()
+        val byPage = loadStrokesForPages(noteId, (0 until pageCount).toList())
+        return List(pageCount) { byPage[it] ?: emptyList() }
+    }
 
     suspend fun saveNote(
         note: Note,
@@ -440,7 +607,14 @@ class NoteRepository(private val context: Context) {
     ) {
         val snapshot = strokesByPage.map { Collections.unmodifiableList(ArrayList(it)) }
         withContext(Dispatchers.IO) {
-            withStorageLock {
+            withStorageLock(mutates = true) {
+                // A placeholder from a failed load must never replace a real note.json.
+                // Allow only when the session already treats this id as that exact title
+                // (a user-named note), not when cache has different/missing metadata.
+                if (note.title == UNREADABLE_TITLE && noteCache[note.id]?.title != UNREADABLE_TITLE) {
+                    Log.w(TAG, "refusing to overwrite note.json for ${note.id} with unreadable placeholder")
+                    return@withContext
+                }
                 val baselines = persistedStrokes
                 var previous = baselines.remove(note.id)
                 val notes = notesDir()
@@ -450,7 +624,7 @@ class NoteRepository(private val context: Context) {
                     val segs = folderSegments(note.folder)
                     val parent = navigate(notes, segs, create = true) ?: return@withContext
                     val name = uniqueChildName(parent, sanitize(note.title))
-                    pathIndex[note.id] = (segs + name).joinToString("/")
+                    setPathIndex(note.id, (segs + name).joinToString("/"))
                     createDirectory(parent, name) ?: return@withContext
                 }
                 val saved = note.withUpdatedAt()
@@ -487,7 +661,7 @@ class NoteRepository(private val context: Context) {
 
     suspend fun renameNote(noteId: String, newTitle: String) {
         withContext(Dispatchers.IO) {
-            withStorageLock {
+            withStorageLock(mutates = true) {
                 val dir = resolveNoteDir(noteId) ?: return@withContext
                 val jsonFile = resolveFile(dir, "note.json") ?: return@withContext
                 val note = noteCache[noteId] ?: json.decodeFromString<Note>(readText(jsonFile))
@@ -506,7 +680,7 @@ class NoteRepository(private val context: Context) {
                     val unique = uniqueChildName(parent, desired)
                     invalidateDirectories()
                     if (dir.renameTo(unique)) {
-                        pathIndex[noteId] = if (parentPath.isNullOrEmpty()) unique else "$parentPath/$unique"
+                        setPathIndex(noteId, if (parentPath.isNullOrEmpty()) unique else "$parentPath/$unique")
                         persistIndex(notes)
                     }
                 }
@@ -518,7 +692,7 @@ class NoteRepository(private val context: Context) {
     suspend fun setNoteFolder(noteId: String, folder: String) {
         if (folder.isNotEmpty()) createFolder(folder)
         withContext(Dispatchers.IO) {
-            withStorageLock {
+            withStorageLock(mutates = true) {
                 val notes = notesDir()
                 val dir = resolveNoteDir(noteId) ?: return@withContext
                 val jsonFile = resolveFile(dir, "note.json") ?: return@withContext
@@ -536,7 +710,7 @@ class NoteRepository(private val context: Context) {
                     invalidateDirectories()
                     if (dir.renameTo(unique)) {
                         val rel = (segs + unique).joinToString("/")
-                        pathIndex[noteId] = rel
+                        setPathIndex(noteId, rel)
                         persistIndex(notes)
                     }
                 }
@@ -557,7 +731,7 @@ class NoteRepository(private val context: Context) {
     suspend fun createFolder(path: String) {
         if (path.isBlank()) return
         withContext(Dispatchers.IO) {
-            withStorageLock {
+            withStorageLock(mutates = true) {
                 val notes = notesDir()
                 navigate(notes, folderSegments(path), create = true)
                 val existing = runCatching {
@@ -574,15 +748,15 @@ class NoteRepository(private val context: Context) {
 
     suspend fun deleteNote(noteId: String) {
         withContext(Dispatchers.IO) {
-            withStorageLock {
+            withStorageLock(mutates = true) {
                 noteCache.remove(noteId)
                 persistedStrokes.remove(noteId)
                 val prefix = "$noteId:"
-                strokeCache.keys.removeAll { it.startsWith(prefix) }
+                strokeCache.removeKeysIf { it.startsWith(prefix) }
                 val dir = resolveNoteDir(noteId)
                 invalidateDirectories()
                 dir?.delete()
-                pathIndex.remove(noteId)
+                if (pathIndex.remove(noteId) != null) pathIndexDirty = true
                 runCatching { persistIndex(notesDir()) }
             }
         }
@@ -592,7 +766,7 @@ class NoteRepository(private val context: Context) {
 
     suspend fun importAsset(noteId: String, stream: java.io.InputStream, mime: String): String =
         withContext(Dispatchers.IO) {
-            withStorageLock {
+            withStorageLock(mutates = true) {
                 val dir = resolveNoteDir(noteId) ?: error("note not found")
                 var assets = childDocuments.children(dir)["assets"]
                 if (assets == null || !assets.isDirectory) assets = createDirectory(dir, "assets")
@@ -629,7 +803,7 @@ class NoteRepository(private val context: Context) {
      */
     suspend fun migrate(fromUri: String?, toUri: String?) {
         withContext(Dispatchers.IO) {
-            withStorageLock {
+            withStorageLock(mutates = true) {
                 invalidateDirectories()
                 persistedStrokes = ConcurrentHashMap()
                 strokeCache.clear()
@@ -645,7 +819,7 @@ class NoteRepository(private val context: Context) {
                     }
                     copyTree(from, to, 0)
                 } finally {
-                    pathIndex.clear()
+                    clearPathIndex()
                     invalidateDirectories()
                 }
             }
@@ -718,6 +892,10 @@ class NoteRepository(private val context: Context) {
         writeBytes(dir, fileName, bytes)
     }
 
+    /**
+     * Writes [bytes] to [fileName]. Existing files are truncated in one open+write ("wt")
+     * so a shorter payload cannot leave trailing garbage from the previous content.
+     */
     private suspend fun writeBytes(dir: DocumentFile, fileName: String, bytes: ByteArray): DocumentFile {
         val file = resolveFile(dir, fileName) ?: dir.createFile(FILE_MIME, fileName)
             ?.let { childDocuments.created(dir, it) }

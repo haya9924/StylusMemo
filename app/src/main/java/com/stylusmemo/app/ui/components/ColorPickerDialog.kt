@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -45,11 +46,17 @@ fun Long.toColor(): Color = Color(this.toInt())
 
 fun Color.toArgbLong(): Long = toArgb().toLong() and 0xFFFFFFFFL
 
+/**
+ * HSV colour picker. [allowAlpha] adds a translucency slider and keeps the alpha byte in the value
+ * handed to [onPick]; it is off for opaque tools such as the pen. Without it a picked colour is
+ * always fully opaque, which silently destroyed the highlighter's translucency.
+ */
 @Composable
 fun ColorPickerDialog(
     initialArgb: Long,
     onPick: (Long) -> Unit,
     onDismiss: () -> Unit,
+    allowAlpha: Boolean = false,
 ) {
     var hue by remember(initialArgb) {
         mutableStateOf(Color(initialArgb.toInt()).let { c ->
@@ -66,12 +73,21 @@ fun ColorPickerDialog(
             floatArrayOf(0f, 0f, 0f).also { android.graphics.Color.colorToHSV(c.toArgb(), it) }[2]
         })
     }
+    var alpha by remember(initialArgb) {
+        mutableStateOf(if (allowAlpha) ((initialArgb.toInt() ushr 24) and 0xFF) / 255f else 1f)
+    }
 
     val currentColor = Color.hsv(hue, sat.coerceIn(0f, 1f), value.coerceIn(0f, 1f))
+    val pickedArgb: Long = if (allowAlpha) {
+        (((alpha.coerceIn(0f, 1f) * 255f + 0.5f).toInt().coerceIn(0, 255).toLong() shl 24) or
+            (currentColor.toArgbLong() and 0x00FFFFFFL))
+    } else {
+        currentColor.toArgbLong()
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("ペンの色") },
+        title = { Text(if (allowAlpha) "蛍光ペンの色" else "ペンの色") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 SVSquare(
@@ -79,12 +95,25 @@ fun ColorPickerDialog(
                     onSelect = { s, v -> sat = s; value = v },
                 )
                 HueBar(hue = hue) { hue = it }
+                if (allowAlpha) {
+                    Column {
+                        Text(
+                            "不透明度 ${(alpha * 100).toInt()} %",
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                        Slider(
+                            value = alpha,
+                            onValueChange = { alpha = it },
+                            valueRange = 0.1f..1f,
+                        )
+                    }
+                }
                 Row(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Box(
-                        Modifier.size(32.dp).background(currentColor, CircleShape)
+                        Modifier.size(32.dp).background(currentColor.copy(alpha = alpha), CircleShape)
                             .border(1.dp, MaterialTheme.colorScheme.outline, CircleShape),
                     )
                     Text("現在の色", style = MaterialTheme.typography.bodySmall)
@@ -93,16 +122,34 @@ fun ColorPickerDialog(
                     PresetColors.forEach { preset ->
                         Box(
                             Modifier.size(28.dp)
-                                .background(Color(preset.toInt()), CircleShape)
+                                .background(
+                                    if (allowAlpha) {
+                                        Color(preset.toInt()).copy(alpha = alpha)
+                                    } else {
+                                        Color(preset.toInt())
+                                    },
+                                    CircleShape,
+                                )
                                 .border(1.dp, MaterialTheme.colorScheme.outline, CircleShape)
-                                .clickable { onPick(preset) },
+                                .clickable {
+                                    // Keep the chosen translucency so a preset never makes the
+                                    // highlighter opaque.
+                                    onPick(
+                                        if (allowAlpha) {
+                                            ((pickedArgb.toInt() and 0xFF000000.toInt()) or
+                                                (preset.toInt() and 0x00FFFFFF)).toLong()
+                                        } else {
+                                            preset
+                                        },
+                                    )
+                                },
                         )
                     }
                 }
             }
         },
         confirmButton = {
-            TextButton(onClick = { onPick(currentColor.toArgbLong()) }) { Text("OK") }
+            TextButton(onClick = { onPick(pickedArgb) }) { Text("OK") }
         },
         dismissButton = {
             TextButton(onClick = onDismiss) { Text("キャンセル") }
