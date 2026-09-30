@@ -69,6 +69,15 @@ import com.stylusmemo.app.ui.components.ColorPickerDialog
 import com.stylusmemo.app.ui.components.StylusCaptureView
 import com.stylusmemo.app.ui.components.toArgbLong
 
+/** Pen width bounds and the nudge step; must match the in-editor pen settings. */
+private const val PEN_SIZE_MIN_MM = 0.05f
+private const val PEN_SIZE_MAX_MM = 4.0f
+private const val PEN_SIZE_STEP_MM = 0.05f
+
+/** Shows two decimals below 1 mm so 0.05 mm steps are actually readable. */
+private fun formatPenSizeMm(value: Float): String =
+    if (value < 1f) "%.2f".format(java.util.Locale.ROOT, value) else "%.1f".format(java.util.Locale.ROOT, value)
+
 @OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
 @Composable
 fun SettingsScreen(
@@ -158,14 +167,34 @@ fun SettingsScreen(
                 }
                 Column {
                     Text(
-                        "線の太さ ${"%.1f".format(s.defaultPenSizeMm)} mm",
+                        "線の太さ ${formatPenSizeMm(s.defaultPenSizeMm)} mm",
                         style = MaterialTheme.typography.bodyMedium,
                     )
-                    Slider(
-                        value = s.defaultPenSizeMm,
-                        onValueChange = { viewModel.setPenSize(it) },
-                        valueRange = 0.2f..4f,
-                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Slider(
+                            value = s.defaultPenSizeMm,
+                            onValueChange = { viewModel.setPenSize(it) },
+                            valueRange = PEN_SIZE_MIN_MM..PEN_SIZE_MAX_MM,
+                            modifier = Modifier.weight(1f),
+                        )
+                        // Explicit steps for the finest widths, which a drag cannot hit reliably.
+                        TextButton(
+                            onClick = {
+                                viewModel.setPenSize(
+                                    (s.defaultPenSizeMm - PEN_SIZE_STEP_MM).coerceAtLeast(PEN_SIZE_MIN_MM),
+                                )
+                            },
+                            enabled = s.defaultPenSizeMm > PEN_SIZE_MIN_MM,
+                        ) { Text("−") }
+                        TextButton(
+                            onClick = {
+                                viewModel.setPenSize(
+                                    (s.defaultPenSizeMm + PEN_SIZE_STEP_MM).coerceAtMost(PEN_SIZE_MAX_MM),
+                                )
+                            },
+                            enabled = s.defaultPenSizeMm < PEN_SIZE_MAX_MM,
+                        ) { Text("＋") }
+                    }
                 }
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     FilterChip(

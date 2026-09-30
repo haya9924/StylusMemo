@@ -647,6 +647,13 @@ class EditorView @JvmOverloads constructor(
                     if (crop == null) controller?.onSnipError?.invoke("SNIP: 1mm以上の範囲を選択してください")
                     else captureSnip(snipPageIndex, page, crop)
                     cancelSnip()
+                    // A snip is a one-shot capture, not a mode you keep drawing in. Hand the pen
+                    // back so writing continues without re-tapping the pen button every time.
+                    // notifyToolChanged keeps the toolbar highlight in sync.
+                    if (tool == EditorTool.SNIP) {
+                        tool = EditorTool.PEN
+                        notifyToolChanged()
+                    }
                 }
             }
         }
@@ -714,11 +721,16 @@ class EditorView @JvmOverloads constructor(
     fun canRedo() = redoStack.isNotEmpty()
 
     fun setTool(t: EditorTool) {
-        if (tool != t) cancelSnip()
+        val changed = tool != t
+        if (changed) cancelSnip()
         tool = t
         if (t != EditorTool.SELECT) clearSelection()
         if (t != EditorTool.LASSO) clearLassoGesture()
         lineActive = false
+        // Switching tools abandons whatever gesture was in flight, so release the input guard and
+        // let the next touch through. Only on a real change: re-binding the same tool happens on
+        // every recomposition and must not cut a stroke in half.
+        if (changed) resetGestureState()
         invalidate()
     }
 
@@ -1074,35 +1086,63 @@ class EditorView @JvmOverloads constructor(
 
     fun addTextBox(text: String, fontSizeMm: Float, colorArgb: Int) {
         val page = currentPage() ?: return
+        val heightMm = (fontSizeMm * 1.8f).coerceAtLeast(20f)
+        val widthMm = min(120f, page.widthMm * 0.6f)
         val box = TextBox(
             text = text,
             fontSizeMm = fontSizeMm,
             colorArgb = colorArgb.toLong() and 0xFFFFFFFFL,
             leftMm = page.widthMm * 0.1f,
-            topMm = page.heightMm * 0.1f,
-            widthMm = min(120f, page.widthMm * 0.6f),
-            heightMm = (fontSizeMm * 1.8f).coerceAtLeast(20f),
+            // Stack below the existing boxes so a new box is never hidden underneath one.
+            topMm = freeTopMm(page.textBoxes.map { it.topMm + it.heightMm }, page.heightMm * 0.1f),
+            widthMm = widthMm,
+            heightMm = heightMm,
             zIndex = (page.textBoxes.maxOfOrNull { it.zIndex } ?: 0) + 1,
         )
         pushUndo(BoxOp(pageIndex, null, box))
         updatePage { p -> p.copy(textBoxes = p.textBoxes + box) }
+        selectNewBox(box.id, "text")
         notifyDocChanged()
     }
 
     fun insertImageBox(assetName: String, widthMm: Float, heightMm: Float) {
         val page = currentPage() ?: return
-        val top = page.imageBoxes.maxOfOrNull { it.topMm + it.heightMm } ?: page.heightMm * 0.1f
         val box = ImageBox(
             assetName = assetName,
             leftMm = (page.widthMm - widthMm) / 2f,
-            topMm = top,
+            topMm = freeTopMm(page.imageBoxes.map { it.topMm + it.heightMm }, page.heightMm * 0.1f),
             widthMm = widthMm,
             heightMm = heightMm,
             zIndex = (page.imageBoxes.maxOfOrNull { it.zIndex } ?: 0) + 1,
         )
         pushUndo(BoxOp(pageIndex, null, box))
         updatePage { p -> p.copy(imageBoxes = p.imageBoxes + box) }
+        selectNewBox(box.id, "image")
         notifyDocChanged()
+    }
+
+    /**
+     * Top edge for a newly inserted box: below everything already on the page, with a gap, and
+     * still clamped onto the page when the stack is taller than the sheet.
+     */
+    private fun freeTopMm(bottoms: List<Float>, defaultTopMm: Float): Float {
+        val lowest = bottoms.maxOrNull() ?: return defaultTopMm
+        return (lowest + 6f).coerceAtMost(defaultTopMm.coerceAtLeast(0f))
+    }
+
+    /**
+     * Selects a just-inserted box and tells the host, so the handles are visible straight away
+     * instead of the new box appearing inert until the user taps it again.
+     */
+    private fun selectNewBox(id: String, kind: String) {
+        val page = currentPage() ?: return
+        val sel: Selection = page.textBoxes.firstOrNull { it.id == id }?.let { TextSel(it) }
+            ?: page.imageBoxes.firstOrNull { it.id == id }?.let { ImageSel(it) }
+            ?: return
+        selected = sel
+        selectAction = SelectAction.NONE
+        controller?.onBoxSelected?.invoke(kind, id)
+        invalidate()
     }
 
     fun updateSelectedText(boxId: String, text: String, fontSizeMm: Float, colorArgb: Int) {
@@ -1286,6 +1326,23 @@ class EditorView @JvmOverloads constructor(
         selected = null
         selectAction = SelectAction.NONE
         invalidate()
+    }
+
+    /**
+     * Releases the state that the ACTION_DOWN guard in [onTouchEvent] inspects. Any one of these
+     * left set makes the view swallow every later touch for every tool, so abandoning a gesture
+     * must clear them here rather than relying on that gesture's own ACTION_UP branch to match.
+     *
+     * Deliberately not called from [clearSelection]: the gesture starters latch [activePointerId]
+     * immediately before clearing the selection, so resetting it there would break drawing.
+     */
+    private fun resetGestureState() {
+        activePointerId = -1
+        gestureMode = GestureMode.NONE
+        gesturePrimaryId = -1
+        palmPointerId = -1
+        grabOffsetX = 0f
+        grabOffsetY = 0f
     }
 
     private fun commitStroke(screenStroke: Stroke): Stroke {
@@ -1721,6 +1778,10 @@ class EditorView @JvmOverloads constructor(
                 clearSelection()
                 clearLassoGesture()
                 lineActive = false
+                // This path assigns the tool directly, so it needs the same gesture release that
+                // setTool performs: a barrel button press mid-gesture must not leave the input
+                // guard latched.
+                resetGestureState()
                 notifyToolChanged()
             }
             ShortcutAction.UNDO -> undo()
@@ -2226,24 +2287,57 @@ class EditorView @JvmOverloads constructor(
         return abs(rx) <= sel.width() / 2f && abs(ry) <= sel.height() / 2f
     }
 
+    /**
+     * Which handle (if any) the page-mm point [mmX], [mmY] is grabbing, mirroring [drawSelection]
+     * exactly: the same screen-pixel handle positions, the same rotation about the box centre, and
+     * a touch radius derived from the drawn dot rather than a fixed page size.
+     *
+     * The previous test compared against unrotated millimetres (an 8 mm square at the corner and
+     * 6 mm above the top edge) while the dots are drawn in screen pixels and rotated with the box,
+     * so the grabbable area did not line up with what the user could see.
+     */
+    private fun selectionHandleAt(sel: Selection, mmX: Float, mmY: Float): SelectAction {
+        val originX = pageLeftPx(pageIndex)
+        val originY = pageTopPx(pageIndex)
+        val left = sel.left() * zoomPxPerMm + originX
+        val top = sel.top() * zoomPxPerMm + originY
+        val w = sel.width() * zoomPxPerMm
+        val h = sel.height() * zoomPxPerMm
+        val cx = left + w / 2f
+        val cy = top + h / 2f
+
+        // Undo the box rotation so the local handle positions can be compared directly, the same
+        // way canvas.rotate in drawSelection moves them.
+        val rad = Math.toRadians(sel.rotationDeg().toDouble())
+        val c = cos(rad).toFloat()
+        val s = sin(rad).toFloat()
+        val dx = mmX * zoomPxPerMm + originX - cx
+        val dy = mmY * zoomPxPerMm + originY - cy
+        val lx = cx + dx * c + dy * s
+        val ly = cy - dx * s + dy * c
+
+        // The drawn dot is 6dp; give it a generous finger-sized target.
+        val touchR = 20f * density
+        val rotateY = top - 12f * density
+        return when {
+            hypot(lx - (left + w / 2f), ly - rotateY) <= touchR -> SelectAction.ROTATE
+            hypot(lx - (left + w), ly - (top + h)) <= touchR -> SelectAction.RESIZE
+            else -> SelectAction.MOVE
+        }
+    }
+
     private fun startSelect(event: MotionEvent, pointerIndex: Int) {
-        activePointerId = event.getPointerId(pointerIndex)
         val x = toMmX(event, pointerIndex)
         val y = toMmY(event, pointerIndex)
         val hit = boxAt(x, y)
         if (hit != null) {
+            // Only take ownership of the pointer once a box is actually grabbed. Latching it
+            // before the hit test left it set on the miss path below, and the ACTION_DOWN guard
+            // in onTouchEvent then swallowed every later touch for every tool.
+            activePointerId = event.getPointerId(pointerIndex)
             selected = hit
             controller?.onBoxSelected?.invoke(if (hit is TextSel) "text" else "image", hit.id)
-            val brX = hit.left() + hit.width()
-            val brY = hit.top() + hit.height()
-            val rotX = hit.left() + hit.width() / 2f
-            val rotY = hit.top() - 6f
-            val hitR = 8f
-            selectAction = when {
-                abs(x - brX) <= hitR && abs(y - brY) <= hitR -> SelectAction.RESIZE
-                abs(x - rotX) <= hitR && abs(y - rotY) <= hitR -> SelectAction.ROTATE
-                else -> SelectAction.MOVE
-            }
+            selectAction = selectionHandleAt(hit, x, y)
             grabOffsetX = x - hit.left()
             grabOffsetY = y - hit.top()
         } else {
@@ -2262,24 +2356,31 @@ class EditorView @JvmOverloads constructor(
         val page = currentPage() ?: return
         when (selectAction) {
             SelectAction.MOVE -> {
-                val nw = (x - grabOffsetX).coerceIn(0f, page.widthMm)
-                val nh = (y - grabOffsetY).coerceIn(0f, page.heightMm)
+                // Clamp so the whole box stays on the page, not just its top-left corner.
+                val nw = (x - grabOffsetX)
+                    .coerceIn(0f, (page.widthMm - sel.width()).coerceAtLeast(0f))
+                val nh = (y - grabOffsetY)
+                    .coerceIn(0f, (page.heightMm - sel.height()).coerceAtLeast(0f))
                 sel.apply(nw, nh, sel.width(), sel.height(), sel.rotationDeg())
                 persistSelection()
             }
             SelectAction.RESIZE -> {
-                val nw = (x - sel.left()).coerceAtLeast(5f)
-                val nh = if (sel is ImageSel) {
-                    nw / sel.width() * sel.height()
+                val maxW = (page.widthMm - sel.left()).coerceAtLeast(MIN_BOX_MM)
+                val maxH = (page.heightMm - sel.top()).coerceAtLeast(MIN_BOX_MM)
+                if (sel is ImageSel) {
+                    // Derive the height from the *clamped* width. The previous code derived it from
+                    // the unclamped width and then clamped the height on its own, so dragging an
+                    // image past the page edge broke its aspect ratio and let it overhang.
+                    val ratio = sel.height() / sel.width()
+                    var nw = (x - sel.left()).coerceAtLeast(MIN_BOX_MM)
+                    if (nw * ratio > maxH) nw = maxH / ratio
+                    nw = nw.coerceAtMost(maxW)
+                    sel.apply(sel.left(), sel.top(), nw, nw * ratio, sel.rotationDeg())
                 } else {
-                    (y - sel.top()).coerceAtLeast(5f)
+                    val nw = (x - sel.left()).coerceIn(MIN_BOX_MM, maxW)
+                    val nh = (y - sel.top()).coerceIn(MIN_BOX_MM, maxH)
+                    sel.apply(sel.left(), sel.top(), nw, nh, sel.rotationDeg())
                 }
-                sel.apply(
-                    sel.left(), sel.top(),
-                    min(nw, page.widthMm - sel.left()),
-                    if (sel is ImageSel) min(nh, page.heightMm - sel.top()) else nh,
-                    sel.rotationDeg(),
-                )
                 persistSelection()
             }
             SelectAction.ROTATE -> {
@@ -2352,7 +2453,10 @@ class EditorView @JvmOverloads constructor(
             GestureMode.SCALE -> {
                 if (gStartDist <= 0f) return
                 val dist = distance(event)
-                val newZoom = (gStartZoom * dist / gStartDist).coerceIn(0.3f, 25f)
+                // The page bitmap itself is capped at MAX_CONTENT_PIXELS / ACTIVE_BITMAP_DPI
+                // (~11 px/mm for A4), so zooming past that magnifies rather than adds detail.
+                // The higher limit is for inspecting fine strokes; memory does not grow.
+                val newZoom = (gStartZoom * dist / gStartDist).coerceIn(MIN_ZOOM_PX_PER_MM, MAX_ZOOM_PX_PER_MM)
                 val (midX, midY) = midpoint(event)
                 val k = newZoom / zoomPxPerMm
                 panX = midX - (midX - panX) * k
@@ -2366,6 +2470,10 @@ class EditorView @JvmOverloads constructor(
     }
 
     private fun endGesture(event: MotionEvent) {
+        // A gesture can be started with activePointerId already latched (the select fall-through
+        // above is one such path), and then no ACTION_UP branch matches to clear it, so release it
+        // here. Leaving it set makes the ACTION_DOWN guard reject input for the rest of the session.
+        activePointerId = -1
         if (event.pointerCount - 1 <= 1) {
             gestureMode = GestureMode.NONE
             if (event.pointerCount - 1 == 1) {
@@ -3140,6 +3248,13 @@ class EditorView @JvmOverloads constructor(
         private const val MM_PER_INCH = 25.4f
         private const val MEMORIZE_RENDER_THROTTLE_MS = 100L
         private const val COMMIT_RENDER_DELAY_MS = 450L
+
+        /** Pinch-zoom bounds in screen pixels per page millimetre. */
+        private const val MIN_ZOOM_PX_PER_MM = 0.3f
+        private const val MAX_ZOOM_PX_PER_MM = 40f
+
+        /** Smallest text/image box edge the resize gesture will produce, in page millimetres. */
+        private const val MIN_BOX_MM = 5f
         private const val SHEET_ALPHA = 110
         private const val SHEET_MOVE_PILL_HALF_W_PX = 32f
         private const val SHEET_MOVE_PILL_HALF_H_PX = 11f

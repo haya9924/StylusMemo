@@ -57,15 +57,25 @@ object NoteExporter {
         return writeBytes(resolver, uri, jpegWithDensity(out.toByteArray(), EXPORT_DPI.toInt()))
     }
 
-    /** Exports all pages of [note] as a single PDF written to [uri]. */
+    /**
+     * Exports pages of [note] as a single PDF written to [uri]. [firstPage] and [lastPage] are
+     * inclusive and clamped to the available pages; pass `0` for both to export every page.
+     * The PDF page order follows the note, so a reversed range still exports ascending.
+     */
     suspend fun exportPdf(
         resolver: ContentResolver,
         uri: Uri,
         note: Note,
         strokes: List<List<Stroke>>,
         assetLoader: suspend (String) -> Bitmap?,
+        firstPage: Int = 0,
+        lastPage: Int = -1,
     ): Boolean {
-        val pages = note.pages
+        val allPages = note.pages
+        if (allPages.isEmpty()) return false
+        val from = firstPage.coerceIn(0, allPages.size - 1)
+        val to = (if (lastPage < 0) allPages.size - 1 else lastPage).coerceIn(from, allPages.size - 1)
+        val pages = allPages.subList(from, to + 1)
         if (pages.isEmpty()) return false
 
         val baos = ByteArrayOutputStream()
@@ -92,14 +102,13 @@ object NoteExporter {
             val page = pages[i]
             val wPts = page.widthMm / MM_PER_INCH * POINTS_PER_INCH
             val hPts = page.heightMm / MM_PER_INCH * POINTS_PER_INCH
-
             obj(
                 pageObj,
                 "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${f(wPts)} ${f(hPts)}] " +
                     "/Resources << /XObject << /Im$i $imgObj 0 R >> >> /Contents $contentObj 0 R >>",
             )
 
-            val bmp = renderPage(page, strokes.getOrNull(i).orEmpty(), assetLoader) ?: return false
+            val bmp = renderPage(page, strokes.getOrNull(from + i).orEmpty(), assetLoader) ?: return false
             val bmpW = bmp.width
             val bmpH = bmp.height
             val jpeg = ByteArrayOutputStream()
@@ -240,6 +249,31 @@ object NoteExporter {
         val bmp = allocateBitmap(wPx, hPx) ?: return null
         val canvas = Canvas(bmp)
         PageRenderer(assetLoader).draw(canvas, page, strokes, wPx, hPx)
+        return bmp
+    }
+
+    /**
+     * Renders a small preview of one page, for the export range picker. [maxDimPx] is the longest
+     * edge in pixels; the aspect ratio follows the page, so thumbnails line up with the real output.
+     * Backgrounds and strokes are drawn, but at this size only the layout is readable — this is not
+     * the export path and never runs at export resolution.
+     */
+    suspend fun renderPreview(
+        page: PageData,
+        strokes: List<Stroke>,
+        assetLoader: suspend (String) -> Bitmap?,
+        maxDimPx: Int = 320,
+    ): Bitmap? {
+        val dim = maxDimPx.coerceAtLeast(48)
+        var w = dim
+        var h = (dim * (page.heightMm / page.widthMm)).toInt().coerceAtLeast(48)
+        if (page.heightMm > page.widthMm) {
+            h = dim
+            w = (dim * (page.widthMm / page.heightMm)).toInt().coerceAtLeast(48)
+        }
+        val bmp = allocateBitmap(w, h) ?: return null
+        val canvas = Canvas(bmp)
+        PageRenderer(assetLoader).draw(canvas, page, strokes, w, h)
         return bmp
     }
 

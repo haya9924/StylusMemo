@@ -127,6 +127,10 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     val snipBusy: StateFlow<Boolean> = _snipBusy
     private val _snipError = MutableStateFlow<String?>(null)
     val snipError: StateFlow<String?> = _snipError
+
+    /** Page-index -> preview bitmap for the export range picker. */
+    private val _exportPreviews = MutableStateFlow<Map<Int, Bitmap>>(emptyMap())
+    val exportPreviews: StateFlow<Map<Int, Bitmap>> = _exportPreviews
     private val snipDecodeMutex = Mutex()
     private var noteGeneration = 0L
     private var openJob: Job? = null
@@ -893,6 +897,53 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /**
+     * Exports pages [firstPage]..[lastPage] (inclusive, 1-based as shown in the picker) of the note
+     * as a PDF. Pages outside the note are clamped rather than rejected.
+     */
+    fun exportPdf(uri: Uri, firstPage: Int, lastPage: Int) {
+        val total = _note.value?.pages?.size ?: 0
+        val from = firstPage.coerceIn(1, maxOf(total, 1)) - 1
+        val to = lastPage.coerceIn(from + 1, maxOf(total, 1)) - 1
+        export(uri) { snap, loader ->
+            NoteExporter.exportPdf(
+                getApplication<StylusMemoApp>().contentResolver,
+                uri,
+                snap.note,
+                snap.strokes,
+                loader,
+                from,
+                to,
+            )
+        }
+    }
+
+    /**
+     * Renders small previews of the given page indices for the export range picker, publishing them
+     * on [exportPreviews]. Runs off the main thread; pages that fail to render are simply omitted.
+     */
+    fun loadExportPreviews(pageIndices: List<Int>, maxDimPx: Int = 320) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val snap = controller.buildSnapshot()?.let { ensureAllLoaded(it) } ?: return@launch
+            val loaded = pageIndices.mapNotNull { index ->
+                val page = snap.note.pages.getOrNull(index) ?: return@mapNotNull null
+                val bitmap = runCatching {
+                    NoteExporter.renderPreview(page, snap.strokes.getOrNull(index).orEmpty(), { name -> loadExportAsset(name) }, maxDimPx)
+                }.getOrNull()
+                if (bitmap != null) index to bitmap else null
+            }.toMap()
+            _exportPreviews.value = _exportPreviews.value + loaded
+        }
+    }
+
+    /** Recycles and forgets the export previews. */
+    fun clearExportPreviews() {
+        viewModelScope.launch(Dispatchers.IO) {
+            _exportPreviews.value.values.forEach { if (!it.isRecycled) it.recycle() }
+            _exportPreviews.value = emptyMap()
+        }
+    }
+
     /** Exports the current page as a JPEG to [uri] chosen via the system file picker. */
     fun exportJpeg(uri: Uri) {
         export(uri) { snap, loader ->
@@ -1041,6 +1092,9 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
 
     override fun onCleared() {
         flushSave()
+        // Preview bitmaps are owned by this ViewModel; recycle them so they do not outlive it.
+        _exportPreviews.value.values.forEach { if (!it.isRecycled) it.recycle() }
+        _exportPreviews.value = emptyMap()
         val write = lastWrite
         storageScope.launch {
             write?.join()

@@ -159,6 +159,11 @@ fun EditorScreen(
     var showPageMenu by remember { mutableStateOf(false) }
     var showMemorizeColorPicker by remember { mutableStateOf(false) }
 
+    // PDF page range, chosen in the picker before the system file picker opens.
+    var showPdfRangeDialog by remember { mutableStateOf(false) }
+    var pendingPdfRange by remember { mutableStateOf<Pair<Int, Int>?>(null) }
+    val exportPreviews by viewModel.exportPreviews.collectAsState()
+
     val context = LocalContext.current
     val pluginExporters = remember {
         (context.applicationContext as StylusMemoApp).pluginRegistry.noteExporters()
@@ -195,7 +200,10 @@ fun EditorScreen(
     val pdfExportLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("application/pdf"),
     ) { uri ->
-        uri?.let { viewModel.exportPdf(it) }
+        // The range chosen in the picker is held here between that dialog and the file picker.
+        // If the picker is somehow reached without a range, fall back to the whole note.
+        val range = pendingPdfRange ?: (1 to viewModel.pageCount())
+        uri?.let { viewModel.exportPdf(it, range.first, range.second) }
     }
     val jpegExportLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("image/jpeg"),
@@ -224,7 +232,7 @@ fun EditorScreen(
                 onDeletePage = { viewModel.deletePage() },
                 onUndo = { viewModel.undo() },
                 onRedo = { viewModel.redo() },
-                onExportPdf = { pdfExportLauncher.launch("$exportBase.pdf") },
+                onExportPdf = { showPdfRangeDialog = true },
                 onExportJpeg = {
                     jpegExportLauncher.launch("$exportBase-p${currentPageIndex + 1}.jpg")
                 },
@@ -481,6 +489,26 @@ fun EditorScreen(
         )
     }
 
+    if (showPdfRangeDialog) {
+        val total = viewModel.pageCount()
+        PdfRangeDialog(
+            pageCount = total,
+            currentPage = currentPageIndex + 1,
+            previews = exportPreviews,
+            onLoadPreviews = { viewModel.loadExportPreviews(it) },
+            onExport = { first, last ->
+                pendingPdfRange = first to last
+                showPdfRangeDialog = false
+                val suffix = if (first == 1 && last == total) "" else "-p$first-$last"
+                pdfExportLauncher.launch("$exportBase$suffix.pdf")
+            },
+            onDismiss = {
+                showPdfRangeDialog = false
+                viewModel.clearExportPreviews()
+            },
+        )
+    }
+
     if (showMemorizeColorPicker) {
         val memState = memorizePluginState
         if (memState != null) {
@@ -577,7 +605,7 @@ private fun EditorTopBar(
             }
             DropdownMenu(expanded = showExportMenu, onDismissRequest = { showExportMenu = false }) {
                 DropdownMenuItem(
-                    text = { Text("PDF で書き出し") },
+                    text = { Text("PDF で書き出し（ページ選択）") },
                     onClick = { showExportMenu = false; onExportPdf() },
                 )
                 DropdownMenuItem(
@@ -917,6 +945,15 @@ private fun SplitDivider(
     }
 }
 
+/** Pen width bounds and the nudge step; fine widths need an explicit step, not just a drag. */
+private const val PEN_SIZE_MIN_MM = 0.05f
+private const val PEN_SIZE_MAX_MM = 4.0f
+private const val PEN_SIZE_STEP_MM = 0.05f
+
+/** Shows two decimals below 1 mm so 0.05 mm steps are actually readable. */
+private fun formatSizeMm(value: Float): String =
+    if (value < 1f) "%.2f".format(java.util.Locale.ROOT, value) else "%.1f".format(java.util.Locale.ROOT, value)
+
 @Composable
 private fun PenSettingsDialog(
     colorArgb: Long,
@@ -970,8 +1007,27 @@ private fun PenSettingsDialog(
                     )
                 }
                 Column {
-                    Text("線の太さ ${"%.1f".format(size)} mm", style = MaterialTheme.typography.bodyMedium)
-                    Slider(value = size, onValueChange = { size = it; onSize(it) }, valueRange = 0.2f..4f)
+                    Text(
+                        "線の太さ ${formatSizeMm(size)} mm",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Slider(
+                            value = size,
+                            onValueChange = { size = it; onSize(it) },
+                            valueRange = PEN_SIZE_MIN_MM..PEN_SIZE_MAX_MM,
+                            modifier = Modifier.weight(1f),
+                        )
+                        // Dragging cannot reliably hit the finest steps, so nudge them explicitly.
+                        TextButton(
+                            onClick = { size = (size - PEN_SIZE_STEP_MM).coerceAtLeast(PEN_SIZE_MIN_MM); onSize(size) },
+                            enabled = size > PEN_SIZE_MIN_MM,
+                        ) { Text("−") }
+                        TextButton(
+                            onClick = { size = (size + PEN_SIZE_STEP_MM).coerceAtMost(PEN_SIZE_MAX_MM); onSize(size) },
+                            enabled = size < PEN_SIZE_MAX_MM,
+                        ) { Text("＋") }
+                    }
                 }
                 if (highlightAvailable) {
                     Divider()
@@ -1118,13 +1174,107 @@ private fun PageMenuDialog(
     )
 }
 
+/**
+ * PDF 書き出しのページ範囲を選ぶダイアログ。ページ番号の指定に加えて、実際に書き出される範囲を
+ * サムネイルで確認できるようにしている。プレビューはレンダリング中も描画し、届いたら差し替える。
+ */
+@Composable
+private fun PdfRangeDialog(
+    pageCount: Int,
+    currentPage: Int,
+    previews: Map<Int, android.graphics.Bitmap>,
+    onLoadPreviews: (List<Int>) -> Unit,
+    onExport: (first: Int, last: Int) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var first by remember(pageCount) { mutableStateOf(1) }
+    var last by remember(pageCount) { mutableStateOf(pageCount.coerceAtLeast(1)) }
+    val from = first.coerceIn(1, pageCount.coerceAtLeast(1))
+    val to = last.coerceIn(from, pageCount.coerceAtLeast(1))
+
+    // Load the visible strip plus the selected range, once per selection change.
+    val needed = remember(from, to, pageCount) {
+        ((from - 1).coerceAtLeast(0)..minOf(pageCount - 1, from + 5).coerceAtLeast(0)).toList()
+    }
+    LaunchedEffect(needed) {
+        val missing = needed.filter { !previews.containsKey(it) }
+        if (missing.isNotEmpty()) onLoadPreviews(missing)
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("PDF で書き出すページ") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    OutlinedButton(onClick = { first = from - 1 }, enabled = from > 1) { Text("−") }
+                    Text("開始 $from", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.widthIn(min = 72.dp))
+                    OutlinedButton(
+                        onClick = { first = from + 1 },
+                        enabled = from < pageCount,
+                    ) { Text("＋") }
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    OutlinedButton(onClick = { last = to - 1 }, enabled = to > from) { Text("−") }
+                    Text("終了 $to", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.widthIn(min = 72.dp))
+                    OutlinedButton(
+                        onClick = { last = to + 1 },
+                        enabled = to < pageCount,
+                    ) { Text("＋") }
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    OutlinedButton(
+                        onClick = { first = currentPage.coerceIn(1, pageCount.coerceAtLeast(1)); last = first },
+                    ) { Text("現在ページ") }
+                    OutlinedButton(onClick = { first = 1; last = pageCount.coerceAtLeast(1) }) { Text("すべて") }
+                }
+                Text(
+                    "${to - from + 1} ページを書き出します",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Divider()
+                Text("プレビュー", style = MaterialTheme.typography.labelMedium)
+                Row(
+                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    (from..to).forEach { p ->
+                        val bmp = previews[p - 1]
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            if (bmp != null) {
+                                androidx.compose.foundation.Image(
+                                    bitmap = bmp.asImageBitmap(),
+                                    contentDescription = "${p} ページ目",
+                                    modifier = Modifier.size(width = 56.dp, height = 78.dp),
+                                )
+                            } else {
+                                Box(
+                                    Modifier.size(width = 56.dp, height = 78.dp),
+                                    contentAlignment = Alignment.Center,
+                                ) { Text("…", style = MaterialTheme.typography.bodySmall) }
+                            }
+                            Text("$p", style = MaterialTheme.typography.labelSmall)
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { onExport(from, to) }) { Text("書き出す") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("キャンセル") }
+        },
+    )
+}
+
 @Composable
 private fun ImageWidthDialog(
     pageWidthMm: Float,
     onInsert: (Float) -> Unit,
     onDismiss: () -> Unit,
-) {
-    var width by remember { mutableStateOf(pageWidthMm * 0.8f) }
+) {    var width by remember { mutableStateOf(pageWidthMm * 0.8f) }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("画像を挿入") },
